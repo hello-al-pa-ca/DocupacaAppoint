@@ -1,37 +1,17 @@
-// =================================================================
-// Test Functions for GAS Editor
-// =================================================================
-
-/**
- * 【エディタ実行用】提供された固定の引数でexecuteAISalesActionを直接実行するテスト関数
- */
-function test_executeAISalesAction_with_hardcoded_args() {
-    const recordId = 'D0DF2170-EC27-4906-A53F-131581C1FDF3';
-    const organizationId = 'b7f7113f-771e-4d3d-bf76-2ade7d8f4cbe';
-    const accountId = '9250CC98-C95A-43D9-B261-E7EFD163B5E3-b3ac984e';
-    const AIRoleName = 'AI 営業マン';
-    const actionName = 'あいさつ';
-    const contactMethod = 'メール';
-    const mainPrompt = '初めて連絡する顧客へ、丁寧な自己紹介と簡潔な挨拶のメール文面を作成してください。件名も提案してください。';
-    const addPrompt = '';
-    const companyName = '池田泉州銀行';
-    const companyAddress = '吹田市豊津町9番1号 EDGE江坂19F';
-    const attachmentFileName = '';
-    const execUserEmail = 'hello@al-pa-ca.com';
-
-    Logger.log("以下のハードコードされたパラメータで実行します:");
-    Logger.log({recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, attachmentFileName, execUserEmail});
-
-    executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, attachmentFileName, execUserEmail);
-}
-
 /**
  * =================================================================
- * AI Sales Cycle Co-pilot for AppSheet (v20 - Final JOIN Syntax Fix)
+ * AI Sales Action (RAG機能除外・レスポンス整形機能強化版 v11)
  * =================================================================
- * メインの実行ロジック(SalesCopilot)と、RAG機能(RAGClient, VectorDBManager)を
- * クラスとして分離し、コードの構造を全面的に再構成。
- * BigQueryのVECTOR_SEARCHでフィルタリングを行うための正しいSQL構文に修正。
+ * 既存の AISalesAction.gs からRAG (Retrieval-Augmented Generation)
+ * に関連する機能をすべて削除し、リファクタリングしたバージョンです。
+ *
+ * 主な変更点:
+ * - SalesCopilotクラスを、AIによる文章生成と次アクション提案のコア機能に特化。
+ * - placeholdersの役割を変更し、addPromptの内容を主要なプレースホルダーに割り当て。
+ * - Google検索のロジックを「企業調査→本文生成」の2段階に変更し、調査結果をプロンプトに反映させるように強化。
+ * - 無限ループの原因となっていた、処理開始時のステータス更新処理を削除。
+ * - 【v11での修正】AIの応答に不要な解説が含まれないよう、プロンプトに制約を追加。
+ * =================================================================
  */
 
 // =================================================================
@@ -43,95 +23,74 @@ const MASTER_SHEET_NAMES = {
   salesFlows: 'ActionFlow'
 };
 
-const BIGQUERY_PROJECT_ID = '840992148496';
-const BIGQUERY_DATASET_ID = 'rag_knowledge_base';
-const BIGQUERY_TABLE_ID = 'knowledge_base';
-const BIGQUERY_LOCATION = 'US'; // データセットのロケーションに合わせて変更してください
-
 // =================================================================
 // グローバル関数 (AppSheetまたは手動で実行)
 // =================================================================
 
 /**
- * 【AppSheetから実行】AIによる文章生成を指示する
+ * 【AppSheetから実行】AIによる文章生成を指示します。
  */
-function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', attachmentFileName = '', execUserEmail) {
+function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', customerContactName = '', ourContactName = '', probability = '', attachmentFileName = '', execUserEmail) {
   try {
     const copilot = new SalesCopilot(execUserEmail);
-    copilot.executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, attachmentFileName);
+    copilot.executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability);
   } catch (e) {
-    Logger.log(`❌ ラッパー関数で致命的なエラー: ${e.message}`);
+    Logger.log(`❌ executeAISalesActionで致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
   }
 }
 
 /**
- * 【AppSheetから実行】アクションの結果に基づき、次のアクションを提案する
+ * 【AppSheetから実行】アクションの結果に基づき、次のアクションを提案します。
  */
 function suggestNextAction(completedActionId, execUserEmail) {
   try {
     const copilot = new SalesCopilot(execUserEmail);
     copilot.suggestNextAction(completedActionId);
   } catch (e) {
-    Logger.log(`❌ ラッパー関数で致命的なエラー: ${e.message}`);
-  }
-}
-
-/**
- * 【手動・定時実行】管理用スプレッドシートを元に、全アカウントのナレッジベースを更新する
- */
-function runDailyIndexUpdate() {
-  try {
-    const accountSheetId = PropertiesService.getScriptProperties().getProperty('ACCOUNT_SHEET_ID');
-    if (!accountSheetId) throw new Error("アカウント管理シートのIDがスクリプトプロパティに設定されていません。");
-
-    const sheet = SpreadsheetApp.openById(accountSheetId).getSheets()[0];
-    const [headers, ...rows] = sheet.getDataRange().getValues();
-    const orgIdIndex = headers.indexOf('organization_id'), accountIdIndex = headers.indexOf('account_id'), folderIdIndex = headers.indexOf('rag_gdrive_folder_id');
-
-    if (orgIdIndex === -1 || accountIdIndex === -1 || folderIdIndex === -1) {
-      throw new Error("アカウント管理シートのヘッダーに 'organization_id', 'account_id', 'rag_gdrive_folder_id' のいずれかが見つかりません。");
-    }
-
-    const dbManager = new VectorDBManager(BIGQUERY_PROJECT_ID, BIGQUERY_DATASET_ID, BIGQUERY_TABLE_ID);
-
-    rows.forEach(row => {
-      const organizationId = row[orgIdIndex], accountId = row[accountIdIndex], folderId = row[folderIdIndex];
-      if (organizationId && accountId && folderId) {
-        Logger.log(`--- Indexing started for Account: ${accountId} ---`);
-        dbManager.recreateIndexFromDriveFolder(organizationId, accountId, folderId);
-        Logger.log(`--- Indexing finished for Account: ${accountId} ---`);
-      }
-    });
-  } catch (e) {
-    Logger.log(`❌ 一括インデックス更新中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    Logger.log(`❌ suggestNextActionで致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
   }
 }
 
 // =================================================================
-// Test Functions for GAS Editor
+// テスト関数 (GASエディタ実行用)
 // =================================================================
 
 /**
- * 【エディタ実行用】提供された固定の引数でexecuteAISalesActionを直接実行するテスト関数
+ * 【エディタ実行用】固定引数でexecuteAISalesActionをテストします。
  */
-function test_executeAISalesAction_with_hardcoded_args() {
-    const recordId = 'D0DF2170-EC27-4906-A53F-131581C1FDF3';
-    const organizationId = 'b7f7113f-771e-4d3d-bf76-2ade7d8f4cbe';
-    const accountId = '9250CC98-C95A-43D9-B261-E7EFD163B5E3-b3ac984e';
+function test_executeAISalesAction() {
+    const recordId = '7FBCF696-7397-49A3-BC8C-7E5E3AB3AAB4'; // テスト用のレコードID
     const AIRoleName = 'AI 営業マン';
     const actionName = 'あいさつ';
     const contactMethod = 'メール';
-    const mainPrompt = '初めて連絡する顧客へ、丁寧な自己紹介と簡潔な挨拶のメール文面を作成してください。件名も提案してください。';
-    const addPrompt = '';
-    const companyName = '池田泉州銀行';
-    const companyAddress = '吹田市豊津町9番1号 EDGE江坂19F';
-    const attachmentFileName = '';
-    const execUserEmail = 'hello@al-pa-ca.com';
+    const mainPrompt = `初めて連絡する顧客へ、丁寧な自己紹介と簡潔な挨拶のメール文面を作成してください。件名も提案してください。
+Output Example
+[会社名]
+[氏名] 様
 
-    Logger.log("以下のハードコードされたパラメータで実行します:");
-    Logger.log({recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, attachmentFileName, execUserEmail});
+株式会社ペーパーカンパニーＡのAlpacaAppSheetです。
+ものづくり産業交流展示会では、お忙しい中お名刺交換させていただき、誠にありがとうございました。
 
-    executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, attachmentFileName, execUserEmail);
+[商談メモの内容を加味した、1言メッセージ]
+
+まだまだ小さな会社ではありますが、経営の効率化や、将来を見据えた体制づくりについて、何かお役に立てることがあるかもしれません。
+
+まずは御礼まで。
+貴重なご縁をありがとうございました。
+
+今後ともどうぞよろしくお願いいたします。`;
+    const addPrompt = 'ドキュパカに興味あり';
+    const companyName = '株式会社テスト';
+    const companyAddress = '東京都千代田区1-1-1';
+    const customerContactName = '山田 太郎'; // 取引先担当者名
+    const ourContactName = '鈴木 一郎'; // 自社担当者名
+    const probability = 'A'; // 契約の確度
+    const execUserEmail = 'hello@al-pa-ca.com'; // 実行ユーザーのメールアドレス
+
+    Logger.log("以下のパラメータでテスト実行します:");
+    Logger.log({recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, execUserEmail});
+
+    executeAISalesAction(recordId, '', '', AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, '', execUserEmail);
 }
 
 
@@ -139,96 +98,83 @@ function test_executeAISalesAction_with_hardcoded_args() {
 // SalesCopilot クラス (メインのアプリケーションロジック)
 // =================================================================
 class SalesCopilot {
+  /**
+   * @constructor
+   * @param {string} execUserEmail - 実行ユーザーのメールアドレス
+   */
   constructor(execUserEmail) {
     if (!execUserEmail) throw new Error("実行ユーザーのメールアドレス(execUserEmail)は必須です。");
-    
+
     this.props = PropertiesService.getScriptProperties().getProperties();
     this.execUserEmail = execUserEmail;
-    this.appSheetClient = this._getAppSheetClient();
-    
+    // AppSheetClientは外部ライブラリとして定義されていると仮定
+    this.appSheetClient = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
+
     const masterSheetId = this.props.MASTER_SHEET_ID;
-    if (!masterSheetId) throw new Error("マスターシートIDが設定されていません。");
-    
-    // ★★★ 変更点1: アカウント管理シートの情報を読み込む ★★★
-    this.accountData = this._loadAccountData(); 
+    if (!masterSheetId) throw new Error("マスターシートのIDがスクリプトプロパティに設定されていません。");
+
+    // マスターデータをスプレッドシートから読み込む
     this.actionCategories = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.actionCategories);
     this.aiRoles = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.aiRoles);
     this.salesFlows = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.salesFlows);
-
-    // RAGClientの初期化は変更なし
-    this.ragClient = new RAGClient(this.execUserEmail); 
   }
 
-  executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', attachmentFileName = '') {
+  /**
+   * AIによる営業アクションの文章を生成し、AppSheetを更新します。
+   */
+  executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability) {
     try {
-      this._updateAppSheetRecord(recordId, { "execute_ai_status": "AI処理中" });
+      // 無限ループを防ぐため、処理開始時のステータス更新は削除
 
       const actionDetails = this._getActionDetails(actionName, contactMethod);
       if (!actionDetails) throw new Error(`アクション定義が見つかりません: ${actionName}/${contactMethod}`);
-      
+
       const aiRoleDescription = this._getAIRoleDescription(AIRoleName);
       if (!aiRoleDescription) throw new Error(`AI役割定義が見つかりません: ${AIRoleName}`);
       
-      const userQueryForRAG = `${companyName || ''} ${companyAddress || ''} ${mainPrompt} ${addPrompt}`;
-      const ragResult = this.ragClient.getContext(userQueryForRAG, organizationId, accountId);
-
-      let fileBlob = null, identifiedFileName = '', fileIdToUse = null;
-      
-      // ★★★ 変更点2: アカウントに対応するフォルダIDを取得してファイル検索を行う ★★★
-      if (attachmentFileName) {
-        const ragFolderId = this._getRagFolderId(accountId);
-        if (ragFolderId) {
-          fileIdToUse = this._getFileIdByName(attachmentFileName, ragFolderId);
-        } else {
-          Logger.log(`アカウントID ${accountId} に対応するRAGフォルダIDが見つかりませんでした。`);
-        }
-      }
-      
-      if (!fileIdToUse) fileIdToUse = this._determineBestAttachment(ragResult.potentialFiles);
-      
-      fileIdToUse = this._getFileIdByName(fileIdToUse, "1T1SG1hCXU3SiQ3xos_-WMayy3gqW6AHg");
-      if (fileIdToUse) {
-        // IDの形式を簡易的にチェック (例: '.' が含まれていない、一定の長さ以上)
-        if (typeof fileIdToUse !== 'string' || fileIdToUse.includes('.') || fileIdToUse.length < 20) {
-            Logger.log(`無効なファイルID形式のためスキップ: ${fileIdToUse}`);
-        } else {
-            try {
-
-                fileBlob = DriveApp.getFileById(fileIdToUse).getBlob();
-                identifiedFileName = fileBlob.getName();
-            } catch(fileError) {
-                Logger.log(`ファイル(ID: ${fileIdToUse})の読み込みに失敗: ${fileError.message}`);
-            }
-        }
-      }
-
       const placeholders = {
-        '[具体的な課題]': mainPrompt, '[資料名]': identifiedFileName || '関連資料',
-        '[以前話した課題]': addPrompt, '[推測される課題]': mainPrompt,
-        '[提案書名]': identifiedFileName || '先日お送りした提案書', '[提案内容]': mainPrompt,
-        '[議題]': mainPrompt, '[期間]': addPrompt,
+        '[具体的な課題]': addPrompt, '[資料名]': addPrompt,
+        '[以前話した課題]': addPrompt, '[推測される課題]': addPrompt,
+        '[提案書名]': addPrompt, '[提案内容]': addPrompt,
+        '[議題]': addPrompt, '[期間]': addPrompt,
         '[顧客の会社名]': companyName, '[企業名]': companyName,
-        '[会社の住所]': companyAddress 
+        '[会社の住所]': companyAddress,
+        '[取引先担当者名]': customerContactName,
+        '[自社担当者名]': ourContactName,
+        '[契約の確度]': probability
       };
-      const finalPrompt = this._buildFinalPrompt(actionDetails.prompt, placeholders, ragResult.context);
       
-      console.log(finalPrompt);
+      const useGoogleSearch = actionDetails.searchGoogle && companyName;
+      let companyInfo = '';
+      if (useGoogleSearch) {
+        Logger.log(`Google検索を有効にして企業情報を調査します: ${companyName}`);
+        companyInfo = this._getCompanyInfo(companyName);
+      }
 
-      const geminiClient = new GeminiClient('gemini-2.0-flash');
+      const template = mainPrompt || actionDetails.prompt;
+      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo);
+      Logger.log(`最終プロンプト: \n${finalPrompt}`);
+
+      const geminiClient = new GeminiClient('gemini-1.5-flash-latest');
       geminiClient.setSystemInstructionText(aiRoleDescription);
-      if (actionDetails.searchGoogle && companyName) geminiClient.enableGoogleSearchTool();
-      if (fileBlob) geminiClient.attachFiles(fileBlob);
+      
       geminiClient.setPromptText(finalPrompt);
 
       const response = geminiClient.generateCandidates();
       const generatedText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
       if (!generatedText) throw new Error('Geminiからの応答が空でした。');
 
-      const updatePayload = this._splitSubjectAndBody(generatedText);
-      updatePayload["execute_ai_status"] = "提案済み";
+      const formattedData = this._formatResponse(generatedText, useGoogleSearch, contactMethod);
       
-      console.log(updatePayload);
-
+      // AppSheetに更新するペイロードを作成
+      const updatePayload = {
+          "suggest_ai_text": formattedData.suggest_ai_text,
+          "subject": formattedData.subject,
+          "body": formattedData.body,
+          "execute_ai_status": "提案済み"
+      };
+      
+      Logger.log(`更新ペイロード: ${JSON.stringify(updatePayload)}`);
       this._updateAppSheetRecord(recordId, updatePayload);
       Logger.log(`処理完了 (AI提案生成): Record ID ${recordId}`);
 
@@ -237,16 +183,22 @@ class SalesCopilot {
       this._updateAppSheetRecord(recordId, { "execute_ai_status": "エラー", "suggest_ai_text": `処理エラー: ${e.message}` });
     }
   }
-  
+
+  /**
+   * 完了したアクションに基づき、次のアクションを提案します。
+   * @param {string} completedActionId - 完了したアクションのレコードID
+   */
   suggestNextAction(completedActionId) {
     try {
-      const completedAction = this._findRecordById('SalesActions', completedActionId);
+      const completedAction = this._findRecordById('SalesAction', completedActionId);
       if (!completedAction) throw new Error(`ID ${completedActionId} のアクションが見つかりません。`);
+
       const nextActionFlow = this._getActionFlowDetails(completedAction['progress'], completedAction['action_name'], completedAction['result']);
       if (!nextActionFlow) {
         this._updateAppSheetRecord(completedActionId, {"next_action_description": "営業フロー完了"});
         return;
       }
+
       const nextActionDetails = this._findNextActionInfo(nextActionFlow.next_action);
       const updatePayload = {
         "next_action_category_id": nextActionDetails.id,
@@ -259,353 +211,198 @@ class SalesCopilot {
   }
 
   // --- プライベートヘルパーメソッド群 ---
-  _getAppSheetClient() { const { APPSHEET_APP_ID, APPSHEET_API_KEY } = this.props; if (!APPSHEET_APP_ID || !APPSHEET_API_KEY) throw new Error('AppSheet接続情報(ID/Key)が不足しています。'); return new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY); }
-  _loadSheetData(sheetId, sheetName) { try { const sheet = SpreadsheetApp.openById(sheetId).getSheetByName(sheetName); const [headers, ...rows] = sheet.getDataRange().getValues(); return rows.map(row => headers.reduce((obj, header, i) => (obj[header] = row[i], obj), {})); } catch(e) { throw new Error(`マスターシート(ID: ${sheetId}, Name: ${sheetName})の読み込みに失敗しました。`); } }
-  
-  // ★★★ 追加メソッド: アカウント情報を読み込む ★★★
-  _loadAccountData() {
-    const accountSheetId = this.props.ACCOUNT_SHEET_ID;
-    if (!accountSheetId) throw new Error("アカウント管理シートのIDがスクリプトプロパティに設定されていません。");
-    const sheet = SpreadsheetApp.openById(accountSheetId).getSheets()[0];
-    const [headers, ...rows] = sheet.getDataRange().getValues();
-    const accountIdIndex = headers.indexOf('id');
-    const folderIdIndex = headers.indexOf('rag_gdrive_folder_id');
-    if (accountIdIndex === -1 || folderIdIndex === -1) {
-      throw new Error("アカウント管理シートのヘッダーに 'account_id', 'rag_gdrive_folder_id' のいずれかが見つかりません。");
-    }
-    // account_id をキー、folder_id を値とするマップを作成
-    return rows.reduce((map, row) => {
-      const accountId = row[accountIdIndex];
-      const folderId = row[folderIdIndex];
-      if (accountId && folderId) {
-        map[accountId] = folderId;
-      }
-      return map;
-    }, {});
-  }
-  
-  // ★★★ 追加メソッド: accountIdからRAGフォルダIDを取得する ★★★
-  _getRagFolderId(accountId) {
-    return this.accountData[accountId] || null;
-  }
 
-  // ★★★ 修正メソッド: _getFileIdByName に folderId を引数として追加 ★★★
-  _getFileIdByName(fileName, folderId) {
-    if (!fileName || !folderId) return null;
+  /**
+   * Google検索を利用して企業情報を取得します。
+   * @private
+   */
+  _getCompanyInfo(companyName) {
     try {
-      const folder = DriveApp.getFolderById(folderId);
-      const files = folder.getFilesByName(fileName);
-      if (files.hasNext()) {
-        return files.next().getId();
-      }
-      return null;
+        const researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
+        const researchClient = new GeminiClient('gemini-1.5-flash-latest');
+        researchClient.enableGoogleSearchTool();
+        researchClient.setPromptText(researchPrompt);
+        const response = researchClient.generateCandidates();
+        const info = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+        Logger.log(`企業情報の調査結果:\n${info}`);
+        return info;
     } catch (e) {
-      Logger.log(`ファイル検索エラー (FolderID: ${folderId}, FileName: ${fileName}): ${e.message}`);
-      return null;
+        Logger.log(`企業情報の調査中にエラーが発生しました: ${e.message}`);
+        return ''; // エラー時は空文字を返す
     }
   }
-  
-  _splitSubjectAndBody(text, contactMethod) {
-  // 基本のレスポンス構造
-  const response = {
-    "suggest_ai_text": text,
-    "subject": "",
-    "body": ""
-  };
 
-  // 接触方法がメールの場合のみ、件名と本文を抽出
-  if (contactMethod === 'メール') {
-    const subjectMarker = '【件名】';
-    const bodyMarker = '【本文】';
-    
-    const subjectIndex = text.indexOf(subjectMarker);
-    const bodyIndex = text.indexOf(bodyMarker);
-    
-    if (subjectIndex !== -1 && bodyIndex !== -1) {
-      // 件名と本文を抽出
-      let subject = text.substring(subjectIndex + subjectMarker.length, bodyIndex).trim();
-      let body = text.substring(bodyIndex + bodyMarker.length).trim();
-      
-      // 件名から改行を除去
-      subject = subject.replace(/\n/g, ' ').trim();
-      
-      response.subject = subject;
-      response.body = body;
-    } else if (subjectIndex !== -1) {
-      // 件名のみ見つかった場合
-      let subject = text.substring(subjectIndex + subjectMarker.length).trim();
-      subject = subject.split('\n')[0].trim(); // 最初の行のみを件名とする
-      response.subject = subject;
-      response.body = text;
+
+  /**
+   * AIからのレスポンスを{suggest_ai_text, subject, body}の形式に整形します。
+   * @private
+   */
+  _formatResponse(rawText, useGoogleSearch, contactMethod) {
+    // Google検索を利用したかどうかに関わらず、レスポンスの形式が統一されているため、
+    // 整形ロジックは一つにまとめることができる。
+    // ただし、検索時と非検索時でAIの応答の仕方が変わる可能性を考慮し、ロジックは分離しておく。
+    if (useGoogleSearch) {
+      Logger.log("Google検索結果を含むテキストを整形します...");
+      // 二次的な整形は、検索結果がうまく反映されなかった場合にのみ有効。
+      // 今回は`_buildFinalPrompt`で情報を渡しているため、通常の分割ロジックで対応可能。
+      return this._splitSubjectAndBody(rawText, contactMethod);
     } else {
-      // マーカーが見つからない場合、全文を本文として扱う
-      response.body = text;
+      return this._splitSubjectAndBody(rawText, contactMethod);
+    }
+  }
+
+  _getAppSheetClient() {
+    const { APPSHEET_APP_ID, APPSHEET_API_KEY } = this.props;
+    if (!APPSHEET_APP_ID || !APPSHEET_API_KEY) throw new Error('AppSheet接続情報(ID/Key)がスクリプトプロパティに設定されていません。');
+    return new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY);
+  }
+
+  _loadSheetData(sheetId, sheetName) {
+    try {
+      const sheet = SpreadsheetApp.openById(sheetId).getSheetByName(sheetName);
+      const [headers, ...rows] = sheet.getDataRange().getValues();
+      return rows.map(row => headers.reduce((obj, header, i) => (obj[header] = row[i], obj), {}));
+    } catch (e) {
+      throw new Error(`マスターシート(ID: ${sheetId}, Name: ${sheetName})の読み込みに失敗しました。: ${e.message}`);
+    }
+  }
+
+  /**
+   * テキストを件名と本文に分割します。
+   * @private
+   */
+  _splitSubjectAndBody(text, contactMethod) {
+    const response = { "suggest_ai_text": text, "subject": "", "body": text };
+
+    if (contactMethod === 'メール') {
+      const subjectMarker = '【件名】';
+      const bodyMarker = '【本文】';
       
-      // 件名を推測で抽出する試み（最初の行が件名の可能性）
-      const lines = text.split('\n');
-      if (lines.length > 0 && lines[0].length < 50 && !lines[0].includes('様')) {
-        response.subject = lines[0].trim();
-        response.body = lines.slice(1).join('\n').trim();
+      const subjectIndex = text.indexOf(subjectMarker);
+      
+      if (subjectIndex !== -1) {
+        const bodyIndex = text.indexOf(bodyMarker, subjectIndex);
+        let subjectText = '';
+        let bodyText = '';
+
+        if (bodyIndex !== -1) {
+          subjectText = text.substring(subjectIndex + subjectMarker.length, bodyIndex).trim();
+          bodyText = text.substring(bodyIndex + bodyMarker.length).trim();
+        } else {
+          const lines = text.substring(subjectIndex + subjectMarker.length).trim().split('\n');
+          subjectText = lines.find(line => line.trim() !== '') || '';
+          const subjectLineIndex = lines.findIndex(line => line === subjectText);
+          bodyText = lines.slice(subjectLineIndex + 1).join('\n').trim();
+        }
+        
+        response.subject = subjectText.replace(/[\r\n]/g, ' ').trim();
+        response.body = bodyText;
+
       }
     }
-  }
-  // メール以外の接触方法の場合、subjectとbodyは空文字列のまま
-
-  Logger.log(`件名抽出結果: "${response.subject}"`);
-  Logger.log(`本文抽出結果: "${response.body.substring(0, 100)}..."`);
-  
-  return response;
-}
-
-  _determineBestAttachment(files) { if (!files || files.length === 0) return null; const counts = files.reduce((acc, file) => { acc[file] = (acc[file] || 0) + 1; return acc; }, {}); return Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b); }
-
-  _getActionDetails(actionName, contactMethod) { return this.actionCategories.find(row => row.action_name === actionName && row.contact_method === contactMethod) || null; }
-  _getAIRoleDescription(roleName) { const role = this.aiRoles.find(row => row.name === roleName); return role ? role.description : `あなたは優秀な「${roleName}」です。`; }
-  _getActionFlowDetails(currentProgress, currentActionName, currentResult) { return this.salesFlows.find(row => row.progress === currentProgress && row.action_id === currentActionName && row.result === currentResult) || null; }
-  _findNextActionInfo(nextActionName) { const defaultContactMethod = 'メール'; const nextAction = this.actionCategories.find(row => row.action_name === nextActionName && row.contact_method === defaultContactMethod) || this.actionCategories.find(row => row.action_name === nextActionName); if (nextAction && nextAction.id) { return { id: nextAction.id, description: `${nextAction.action_name} (${nextAction.contact_method}) を実施してください。` }; } return { id: null, description: `推奨アクション: ${nextActionName}` }; }
-
-  _buildFinalPrompt(template, placeholders, ragContext) {
-  let finalPrompt = template;
-  
-  // プレースホルダーの置換
-  for (const key in placeholders) {
-    if (placeholders[key]) {
-      // より確実な置換のため、グローバル置換を使用
-      const regex = new RegExp(`\\${key}`, 'g');
-      finalPrompt = finalPrompt.replace(regex, placeholders[key]);
-    }
-  }
-  
-  // 空の住所プレースホルダーのクリーンアップ
-  if (finalPrompt.includes('[会社の住所]')) {
-    finalPrompt = finalPrompt.replace(/（所在地: \[会社の住所\]）/g, '');
-    finalPrompt = finalPrompt.replace(/所在地が\[会社の住所\]とのことで、[^。]*。/g, '');
-    finalPrompt = finalPrompt.replace(/\[会社の住所\]/g, '');
-  }
-  
-  // RAGコンテキストの追加
-  if (ragContext && ragContext !== "（参考情報なし）") {
-    finalPrompt += `\n\n【参考情報】\n${ragContext}`;
-  }
-  
-  // 最終的なプロンプトの調整指示を追加
-  finalPrompt += `\n\n【重要】
-- 必ず【件名】【本文】の形式で回答してください
-- プレースホルダー（[○○]）がある場合は、実際の情報に置き換えてください
-- 件名は簡潔で魅力的にしてください`;
-
-  Logger.log(`最終プロンプト（最初の200文字）: ${finalPrompt.substring(0, 200)}...`);
-  
-  return finalPrompt;
-}
-  
-  _updateAppSheetRecord(recordId, fieldsToUpdate) { const recordData = { "ID": recordId, ...fieldsToUpdate }; return this.appSheetClient.updateRecords('SalesActions', [recordData], this.execUserEmail); }
-  _findRecordById(tableName, recordId){ const selector = `SELECT([ID], [ID] = "${recordId}")`; const properties = { "Selector": selector }; const result = this.appSheetClient.findData(tableName, this.execUserEmail, properties); if(result && result.length > 0) return result[0]; return null; }
-}
-
-
-// =================================================================
-// RAGClient クラス (ナレッジ検索ロジック)
-// =================================================================
-class RAGClient {
-  constructor(execUserEmail) {
-    this.execUserEmail = execUserEmail;
-    this.embeddingClient = new EmbeddingClient('text-embedding-004');
-    this.bigQueryAuthToken = this._getBigQueryAuthToken();
+    return response;
   }
 
-  _getBigQueryAuthToken() {
-    const service = OAuth2.createService('BigQueryRAG')
-      .setTokenUrl('https://accounts.google.com/o/oauth2/token')
-      .setPrivateKey(SERVICE_ACCOUNT_KEY.private_key)
-      .setIssuer(SERVICE_ACCOUNT_KEY.client_email)
-      .setSubject(this.execUserEmail)
-      .setPropertyStore(PropertiesService.getScriptProperties())
-      .setScope('https://www.googleapis.com/auth/bigquery');
-    if (service.hasAccess()) return service.getAccessToken();
-    else {
-      Logger.log(`OAuth2 Error: ${service.getLastError()}`);
-      throw new Error("BigQueryへの認証に失敗しました。");
-    }
+  _getActionDetails(actionName, contactMethod) {
+    return this.actionCategories.find(row => row.action_name === actionName && row.contact_method === contactMethod) || null;
   }
 
-  getContext(userQuery, organizationId, accountId) {
-    const defaultReturn = { context: "（参考情報なし）", potentialFiles: [] };
-    if (!userQuery || !organizationId || !accountId) return defaultReturn;
+  _getAIRoleDescription(roleName) {
+    const role = this.aiRoles.find(row => row.name === roleName);
+    return role ? role.description : `あなたは優秀な「${roleName}」です。`;
+  }
+
+  _getActionFlowDetails(currentProgress, currentActionName, currentResult) {
+    return this.salesFlows.find(row => row.progress === currentProgress && row.action_id === currentActionName && row.result === currentResult) || null;
+  }
+
+  _findNextActionInfo(nextActionName) {
+    const defaultContactMethod = 'メール';
+    const nextAction = this.actionCategories.find(row => row.action_name === nextActionName && row.contact_method === defaultContactMethod)
+                      || this.actionCategories.find(row => row.action_name === nextActionName);
     
-    try {
-      const queryVector = this.embeddingClient.generate(userQuery, 'RETRIEVAL_QUERY');
-      
-      const sql = `
-        SELECT
-          *
-        FROM
-          VECTOR_SEARCH(
-            TABLE \`${BIGQUERY_PROJECT_ID}.${BIGQUERY_DATASET_ID}.${BIGQUERY_TABLE_ID}\`,
-            'embedding',
-            (SELECT @queryVector AS embedding),
-            top_k => 20,
-            distance_type => 'COSINE'
-          )`;
-      
-      const requestBody = {
-        query: sql,
-        useLegacySql: false,
-        queryParameters: [
-          { name: 'queryVector', parameterType: { type: 'ARRAY', arrayType: { type: 'FLOAT64' } }, 
-            parameterValue: { arrayValues: queryVector.map(v => ({ value: v.toString() })) } }
-        ]
-      };
-      
-      const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${BIGQUERY_PROJECT_ID}/queries`;
-      const options = {
-        method: 'post', contentType: 'application/json',
-        headers: { 'Authorization': `Bearer ${this.bigQueryAuthToken}` },
-        payload: JSON.stringify(requestBody), muteHttpExceptions: true
-      };
-      const response = UrlFetchApp.fetch(url, options);
-      const result = JSON.parse(response.getContentText());
-
-      if (result.error || response.getResponseCode() >= 400) {
-        throw new Error(`BigQuery API Error: ${result.error ? JSON.stringify(result.error.errors) : response.getContentText()}`);
-      }
-      if (!result.rows || result.rows.length === 0) return defaultReturn;
-      
-      // ★★★ 最終修正箇所 ★★★
-      // ログから判明したネスト構造(baseフィールド)に直接アクセスするように修正。
-      // baseレコード内のフィールド順序は固定と仮定し、インデックスで指定する。
-      // baseフィールドのスキーマ: [chunk_id, organization_id, account_id, source_document, chunk_text, embedding]
-      const filteredRows = result.rows
-        .map(row => {
-          // row.f[1] が 'base' レコードに対応する
-          const baseRecord = row.f[1].v.f; 
-          return {
-            organization_id: baseRecord[1].v,
-            account_id:      baseRecord[2].v,
-            source_document: baseRecord[3].v,
-            chunk_text:      baseRecord[4].v
-          };
-        })
-        .filter(record => record.organization_id === organizationId && record.account_id === accountId)
-        .slice(0, 5); // 上位5件に制限
-
-      if (filteredRows.length === 0) return defaultReturn;
-      
-      const context = `--- 参考：過去の類似データ ---\n${filteredRows.map(record => record.chunk_text).join('\n---\n')}`;
-      const potentialFiles = filteredRows.map(record => record.source_document).filter(v => v);
-      return { context, potentialFiles };
-    } catch (e) {
-      // エラーメッセージに詳細を追加してデバッグしやすくする
-      const errorMessage = e.stack || e.message;
-      Logger.log(`BigQuery RAG検索エラー: ${errorMessage}`); 
-      throw new Error(`ナレッジベースの検索に失敗しました: ${e.message}`);
+    if (nextAction && nextAction.id) {
+      return { id: nextAction.id, description: `${nextAction.action_name} (${nextAction.contact_method}) を実施してください。` };
     }
+    return { id: null, description: `推奨アクション: ${nextActionName}` };
+  }
+
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '') {
+    let finalPrompt = template;
+
+    for (const key in placeholders) {
+      if (placeholders[key] && finalPrompt.includes(key)) {
+        const regex = new RegExp(`\\${key}`, 'g');
+        finalPrompt = finalPrompt.replace(regex, placeholders[key]);
+      }
+    }
+    
+    let additionalInfo = '\n\n【補足情報】\n';
+    let hasInfo = false;
+    if (placeholders['[顧客の会社名]']) {
+        additionalInfo += `- 宛先企業名: ${placeholders['[顧客の会社名]']}\n`;
+        hasInfo = true;
+    }
+    if (placeholders['[会社の住所]']) {
+        additionalInfo += `- 住所: ${placeholders['[会社の住所]']}\n`;
+        hasInfo = true;
+    }
+    if (placeholders['[取引先担当者名]']) {
+        additionalInfo += `- 宛先担当者名: ${placeholders['[取引先担当者名]']}\n`;
+        hasInfo = true;
+    }
+    if (placeholders['[自社担当者名]']) {
+        additionalInfo += `- 差出人担当者名: ${placeholders['[自社担当者名]']}\n`;
+        hasInfo = true;
+    }
+    if (placeholders['[契約の確度]']) {
+        additionalInfo += `- 契約の確度: ${placeholders['[契約の確度]']}\n`;
+        hasInfo = true;
+    }
+    if (companyInfo) {
+        additionalInfo += `\n--- 企業調査情報 ---\n${companyInfo}\n`;
+        hasInfo = true;
+    }
+
+
+    if(hasInfo){
+        finalPrompt += additionalInfo;
+    }
+
+    // 空のプレースホルダーが残っている場合、それを含む文章ごと削除するなどのクリーンアップ
+    finalPrompt = finalPrompt.replace(/\[[^\]]+\]/g, '');
+
+
+    if (contactMethod === 'メール') {
+        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
+    }
+
+    return finalPrompt;
+  }
+
+  _updateAppSheetRecord(recordId, fieldsToUpdate) {
+    const recordData = { "ID": recordId, ...fieldsToUpdate };
+    return this.appSheetClient.updateRecords('SalesAction', [recordData], this.execUserEmail);
+  }
+
+  _findRecordById(tableName, recordId) {
+    const selector = `SELECT([ID], [ID] = "${recordId}")`;
+    const properties = { "Selector": selector };
+    const result = this.appSheetClient.findData(tableName, this.execUserEmail, properties);
+    if (result && result.length > 0) return result[0];
+    return null;
   }
 }
 
-
-
-
-// =================================================================
-// VectorDBManager クラス (ナレッジ構築ロジック)
-// =================================================================
-class VectorDBManager {
-  constructor(projectId, datasetId, tableId) {
-    this.projectId = projectId;
-    this.datasetId = datasetId;
-    this.tableId = tableId;
-    this.embeddingClient = new EmbeddingClient('text-embedding-004');
-    this.bigQueryAuthToken = this._getBigQueryAuthTokenForManager();
-  }
-  
-  _getBigQueryAuthTokenForManager() {
-    const service = OAuth2.createService('BigQueryManager')
-        .setTokenUrl('https://accounts.google.com/o/oauth2/token')
-        .setPrivateKey(SERVICE_ACCOUNT_KEY.private_key)
-        .setIssuer(SERVICE_ACCOUNT_KEY.client_email)
-        .setPropertyStore(PropertiesService.getScriptProperties())
-        .setScope('https://www.googleapis.com/auth/bigquery');
-    if (service.hasAccess()) return service.getAccessToken();
-    else throw new Error("BigQuery Managerの認証に失敗しました。");
-  }
-
-  recreateIndexFromDriveFolder(organizationId, accountId, folderId) {
-    try {
-      this._deleteRowsByAccountId(accountId);
-      const folder = DriveApp.getFolderById(folderId);
-      const files = folder.getFiles();
-      const rowsToInsert = [];
-      while (files.hasNext()) {
-        const file = files.next();
-        try {
-          const text = this._extractTextFromFile(file);
-          if (!text || text.trim() === '') continue;
-          const chunks = this._splitTextIntoChunks(text, 500);
-          chunks.forEach(chunk => {
-            const vector = this.embeddingClient.generate(chunk, 'RETRIEVAL_DOCUMENT');
-            rowsToInsert.push({
-              json: {
-                chunk_id: Utilities.getUuid(), organization_id: organizationId, account_id: accountId,
-                source_document: file.getId(), chunk_text: chunk, embedding: vector
-              }
-            });
-          });
-        } catch (fileError) {
-          Logger.log(`❌ ファイル処理中にエラー: ${file.getName()}, Error: ${fileError.message}`);
-          continue;
-        }
-      }
-      if (rowsToInsert.length > 0) {
-        const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${this.projectId}/datasets/${this.datasetId}/tables/${this.tableId}/insertAll`;
-        const request = { "rows": rowsToInsert };
-        const options = {
-          method: 'post', contentType: 'application/json',
-          headers: { 'Authorization': `Bearer ${this.bigQueryAuthToken}` },
-          payload: JSON.stringify(request), muteHttpExceptions: true
-        };
-        const response = UrlFetchApp.fetch(url, options);
-        if (response.getResponseCode() >= 400) {
-          throw new Error(`BigQuery InsertAll API Error: ${response.getContentText()}`);
-        }
-        Logger.log(`  ${rowsToInsert.length}件のチャンクをBigQueryに正常に保存しました。`);
-      }
-    } catch (e) {
-      Logger.log(`❌ recreateIndexFromDriveFolderでエラーが発生しました: ${e.message}`);
-      throw e;
-    }
-  }
-
-  _extractTextFromFile(file) {
-    const mimeType = file.getMimeType();
-    if (mimeType === MimeType.PLAIN_TEXT || mimeType === MimeType.GOOGLE_DOCS) {
-      return file.getBlob().getDataAsString('UTF-8');
-    } else if (mimeType === 'application/pdf') {
-      const tempDoc = Drive.Files.insert({ title: `temp_ocr_${file.getId()}`, mimeType: MimeType.GOOGLE_DOCS }, file.getBlob(), { ocr: true });
-      const text = DocumentApp.openById(tempDoc.id).getBody().getText();
-      Drive.Files.remove(tempDoc.id);
-      return text;
-    }
-    return '';
-  }
-  
-  _deleteRowsByAccountId(accountId) {
-    const sql = `DELETE FROM \`${this.projectId}.${this.datasetId}.${this.tableId}\` WHERE account_id = @accountId`;
-    const requestBody = { query: sql, useLegacySql: false, queryParameters: [ { name: 'accountId', parameterType: { type: 'STRING' }, parameterValue: { value: accountId } } ] };
-    const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${this.projectId}/queries`;
-    const options = {
-      method: 'post', contentType: 'application/json',
-      headers: { 'Authorization': `Bearer ${this.bigQueryAuthToken}` },
-      payload: JSON.stringify(requestBody), muteHttpExceptions: true
-    };
-    const response = UrlFetchApp.fetch(url, options);
-    if(response.getResponseCode() >= 400) {
-        throw new Error(`BigQuery Delete API Error: ${response.getContentText()}`);
-    }
-  }
-
-  _splitTextIntoChunks(text, chunkSize) {
-    const chunks = []; let i = 0;
-    while (i < text.length) { chunks.push(text.substring(i, i + chunkSize)); i += chunkSize; }
-    return chunks;
-  }
-}
+/**
+ * =================================================================
+ * 外部ライブラリに関する注記
+ * =================================================================
+ * このスクリプトは、'AppSheetClient' および 'GeminiClient' クラスが
+ * プロジェクト内の他のスクリプトファイルで定義されていることを
+ * 前提としています。
+ *
+ * このファイルから重複するクラス定義を削除したため、
+ * エラーが解消されるはずです。
+ * =================================================================
+ */
