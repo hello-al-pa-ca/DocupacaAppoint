@@ -123,8 +123,8 @@ function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameB
     try {
       console.log(`Attempt ${attempt} for recordId: ${recordId}`);
       
-      const fileIdFront = findFileIdByName_(APPSHEET_UPLOAD_FOLDER_ID, fileNameFront);
-      const fileIdBack = fileNameBack ? findFileIdByName_(APPSHEET_UPLOAD_FOLDER_ID, fileNameBack) : null;
+      const fileIdFront = findFileIdByName(APPSHEET_UPLOAD_FOLDER_ID, fileNameFront);
+      const fileIdBack = fileNameBack ? findFileIdByName(APPSHEET_UPLOAD_FOLDER_ID, fileNameBack) : null;
       const fileIds = [fileIdFront, fileIdBack].filter(id => id); 
 
       if (!tableName || !recordId || fileIds.length === 0) {
@@ -285,7 +285,9 @@ function getLatLngFromAddress_(address) {
  * 指定されたフォルダ内でファイル名からファイルIDを検索します。
  * @private
  */
-function findFileIdByName_(folderId, fileName) {
+function findFileIdByName(folderId, fileName) {
+  console.log(folderId)
+  console.log(fileName)
   if (!folderId || !fileName) return null;
   try {
     const folder = DriveApp.getFolderById(folderId);

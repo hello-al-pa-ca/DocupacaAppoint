@@ -1,16 +1,16 @@
 /**
  * =================================================================
- * AI Sales Action (RAG機能除外・レスポンス整形機能強化版 v11)
+ * AI Sales Action (RAG機能除外・レスポンス整形機能強化版 v19)
  * =================================================================
  * 既存の AISalesAction.gs からRAG (Retrieval-Augmented Generation)
  * に関連する機能をすべて削除し、リファクタリングしたバージョンです。
  *
  * 主な変更点:
  * - SalesCopilotクラスを、AIによる文章生成と次アクション提案のコア機能に特化。
- * - placeholdersの役割を変更し、addPromptの内容を主要なプレースホルダーに割り当て。
- * - Google検索のロジックを「企業調査→本文生成」の2段階に変更し、調査結果をプロンプトに反映させるように強化。
- * - 無限ループの原因となっていた、処理開始時のステータス更新処理を削除。
- * - 【v11での修正】AIの応答に不要な解説が含まれないよう、プロンプトに制約を追加。
+ * - Google検索のロジックを「企業調査→本文生成」の2段階に変更。
+ * - addPrompt内のGoogle Drive URLを自動で検出し、Markdownリンクに変換する機能を統合。
+ * - 【v19での修正】ご指摘に基づき、execUserEmailが空の場合にセッションから自動取得する
+ * フォールバック処理を削除しました。execUserEmailは必須の引数となります。
  * =================================================================
  */
 
@@ -30,10 +30,29 @@ const MASTER_SHEET_NAMES = {
 /**
  * 【AppSheetから実行】AIによる文章生成を指示します。
  */
-function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', customerContactName = '', ourContactName = '', probability = '', attachmentFileName = '', execUserEmail) {
+function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', customerContactName = '', ourContactName = '', probability = '', eventName = '', ourCompanyInfoText = '', ourCompanyInfoFileId = '', referenceUrls = '', execUserEmail) {
+  
+  if (!execUserEmail) {
+    const errorMessage = "実行ユーザーのメールアドレス(execUserEmail)が渡されませんでした。AppSheetのBot設定で引数にUSEREMAIL()が正しく設定されているか確認してください。";
+    Logger.log(`❌ ${errorMessage}`);
+    try {
+      const props = PropertiesService.getScriptProperties().getProperties();
+      const client = new AppSheetClient(props.APPSHEET_APP_ID, props.APPSHEET_API_KEY);
+      const errorPayload = {
+        "ID": recordId,
+        "execute_ai_status": "エラー",
+        "suggest_ai_text": errorMessage
+      };
+      client.updateRecords('SalesAction', [errorPayload], null); // App Ownerとして実行
+    } catch (updateError) {
+      Logger.log(`❌ エラーステータスの更新に失敗しました: ${updateError.message}`);
+    }
+    return; // 処理を中断
+  }
+
   try {
     const copilot = new SalesCopilot(execUserEmail);
-    copilot.executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability);
+    copilot.executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, ourCompanyInfoText, ourCompanyInfoFileId, referenceUrls);
   } catch (e) {
     Logger.log(`❌ executeAISalesActionで致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
   }
@@ -69,7 +88,7 @@ Output Example
 [氏名] 様
 
 株式会社ペーパーカンパニーＡのAlpacaAppSheetです。
-ものづくり産業交流展示会では、お忙しい中お名刺交換させていただき、誠にありがとうございました。
+[イベント名]では、お忙しい中お名刺交換させていただき、誠にありがとうございました。
 
 [商談メモの内容を加味した、1言メッセージ]
 
@@ -79,18 +98,22 @@ Output Example
 貴重なご縁をありがとうございました。
 
 今後ともどうぞよろしくお願いいたします。`;
-    const addPrompt = 'ドキュパカに興味あり';
+    const addPrompt = `ドキュパカに興味ありとのこと。参考資料はこちらです。https://docs.google.com/document/d/1mCjPNOHvhKLohepguS3bt9E3NEKhNCNVPr7B9MDyPdQ/edit`;
     const companyName = '株式会社テスト';
     const companyAddress = '東京都千代田区1-1-1';
-    const customerContactName = '山田 太郎'; // 取引先担当者名
-    const ourContactName = '鈴木 一郎'; // 自社担当者名
-    const probability = 'A'; // 契約の確度
-    const execUserEmail = 'hello@al-pa-ca.com'; // 実行ユーザーのメールアドレス
+    const customerContactName = '山田 太郎';
+    const ourContactName = '鈴木 一郎';
+    const probability = 'A';
+    const eventName = 'ものづくり産業交流展示会';
+    const ourCompanyInfoText = '弊社はAIを活用したドキュメント管理ツール「ドキュパカ」を提供しており、製造業のDXを支援します。主な製品は「ドキュパカ-Lite」「ドキュパカ-Pro」です。';
+    const ourCompanyInfoFileId = '';
+    const referenceUrls = '';
+    const execUserEmail = 'hello@al-pa-ca.com';
 
     Logger.log("以下のパラメータでテスト実行します:");
-    Logger.log({recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, execUserEmail});
+    Logger.log({recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, ourCompanyInfoText, ourCompanyInfoFileId, referenceUrls, execUserEmail});
 
-    executeAISalesAction(recordId, '', '', AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, '', execUserEmail);
+    executeAISalesAction(recordId, '', '', AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, ourCompanyInfoText, ourCompanyInfoFileId, referenceUrls, execUserEmail);
 }
 
 
@@ -103,17 +126,18 @@ class SalesCopilot {
    * @param {string} execUserEmail - 実行ユーザーのメールアドレス
    */
   constructor(execUserEmail) {
-    if (!execUserEmail) throw new Error("実行ユーザーのメールアドレス(execUserEmail)は必須です。");
+    if (!execUserEmail) {
+      // このコンストラクタは有効なメールアドレスが渡されることを前提とする
+      throw new Error("SalesCopilotの初期化に失敗: 実行ユーザーのメールアドレスは必須です。");
+    }
 
     this.props = PropertiesService.getScriptProperties().getProperties();
     this.execUserEmail = execUserEmail;
-    // AppSheetClientは外部ライブラリとして定義されていると仮定
     this.appSheetClient = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
 
     const masterSheetId = this.props.MASTER_SHEET_ID;
     if (!masterSheetId) throw new Error("マスターシートのIDがスクリプトプロパティに設定されていません。");
 
-    // マスターデータをスプレッドシートから読み込む
     this.actionCategories = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.actionCategories);
     this.aiRoles = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.aiRoles);
     this.salesFlows = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.salesFlows);
@@ -122,26 +146,29 @@ class SalesCopilot {
   /**
    * AIによる営業アクションの文章を生成し、AppSheetを更新します。
    */
-  executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability) {
+  executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, ourCompanyInfoText, ourCompanyInfoFileId, referenceUrls) {
     try {
-      // 無限ループを防ぐため、処理開始時のステータス更新は削除
-
       const actionDetails = this._getActionDetails(actionName, contactMethod);
       if (!actionDetails) throw new Error(`アクション定義が見つかりません: ${actionName}/${contactMethod}`);
 
       const aiRoleDescription = this._getAIRoleDescription(AIRoleName);
       if (!aiRoleDescription) throw new Error(`AI役割定義が見つかりません: ${AIRoleName}`);
       
+      const processedAddPrompt = this._processAddPromptWithMarkdownLinks(addPrompt);
+
       const placeholders = {
-        '[具体的な課題]': addPrompt, '[資料名]': addPrompt,
-        '[以前話した課題]': addPrompt, '[推測される課題]': addPrompt,
-        '[提案書名]': addPrompt, '[提案内容]': addPrompt,
-        '[議題]': addPrompt, '[期間]': addPrompt,
+        '[商談メモの内容を加味した、1言メッセージ]': processedAddPrompt,
+        '[具体的な課題]': processedAddPrompt, '[資料名]': processedAddPrompt,
+        '[以前話した課題]': processedAddPrompt, '[推測される課題]': processedAddPrompt,
+        '[提案書名]': processedAddPrompt, '[提案内容]': processedAddPrompt,
+        '[議題]': processedAddPrompt, '[期間]': processedAddPrompt,
         '[顧客の会社名]': companyName, '[企業名]': companyName,
         '[会社の住所]': companyAddress,
         '[取引先担当者名]': customerContactName,
         '[自社担当者名]': ourContactName,
-        '[契約の確度]': probability
+        '[契約の確度]': probability,
+        '[イベント名]': eventName,
+        '[自社情報]': ourCompanyInfoText
       };
       
       const useGoogleSearch = actionDetails.searchGoogle && companyName;
@@ -150,13 +177,25 @@ class SalesCopilot {
         Logger.log(`Google検索を有効にして企業情報を調査します: ${companyName}`);
         companyInfo = this._getCompanyInfo(companyName);
       }
+      
+      const referenceContent = this._fetchContentFromDriveUrls(referenceUrls);
 
       const template = mainPrompt || actionDetails.prompt;
-      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo);
+      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient('gemini-1.5-flash-latest');
       geminiClient.setSystemInstructionText(aiRoleDescription);
+      
+      if (ourCompanyInfoFileId) {
+        try {
+            const fileBlob = DriveApp.getFileById(ourCompanyInfoFileId).getBlob();
+            geminiClient.attachFiles(fileBlob);
+            Logger.log(`自社情報ファイルを添付しました: ${fileBlob.getName()}`);
+        } catch (e) {
+            Logger.log(`ファイルの添付に失敗しました。File ID: ${ourCompanyInfoFileId}, Error: ${e.message}`);
+        }
+      }
       
       geminiClient.setPromptText(finalPrompt);
 
@@ -166,7 +205,6 @@ class SalesCopilot {
 
       const formattedData = this._formatResponse(generatedText, useGoogleSearch, contactMethod);
       
-      // AppSheetに更新するペイロードを作成
       const updatePayload = {
           "suggest_ai_text": formattedData.suggest_ai_text,
           "subject": formattedData.subject,
@@ -186,7 +224,6 @@ class SalesCopilot {
 
   /**
    * 完了したアクションに基づき、次のアクションを提案します。
-   * @param {string} completedActionId - 完了したアクションのレコードID
    */
   suggestNextAction(completedActionId) {
     try {
@@ -212,10 +249,111 @@ class SalesCopilot {
 
   // --- プライベートヘルパーメソッド群 ---
 
-  /**
-   * Google検索を利用して企業情報を取得します。
-   * @private
-   */
+  _processAddPromptWithMarkdownLinks(textBlock) {
+    if (!textBlock) return '';
+
+    const urlRegex = /https?:\/\/(?:drive|docs)\.google\.com\/(?:file|document|spreadsheets|presentation)\/d\/([a-zA-Z0-9_-]{28,})/g;
+    const uniqueUrls = [...new Set(textBlock.match(urlRegex) || [])];
+    
+    if (uniqueUrls.length === 0) {
+        return textBlock;
+    }
+
+    let processedText = textBlock;
+    uniqueUrls.forEach(url => {
+        try {
+            const fileId = this._extractFileIdFromUrl(url);
+            if (!fileId) return;
+            const fileName = DriveApp.getFileById(fileId).getName();
+            const markdownLink = `[${fileName}](${url})`;
+            const urlPattern = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+            processedText = processedText.replace(urlPattern, markdownLink);
+        } catch (e) {
+            Logger.log(`Error processing URL [${url}] for markdown link: ${e.message}`);
+        }
+    });
+
+    return processedText;
+  }
+  
+  _fetchContentFromDriveUrls(urlsString) {
+      if (!urlsString) return '';
+      
+      const urls = urlsString.split(',').map(url => url.trim()).filter(url => url);
+      let combinedContent = '';
+      
+      for (const url of urls) {
+          try {
+              const fileId = this._extractFileIdFromUrl(url);
+              if (!fileId) continue;
+              
+              const file = DriveApp.getFileById(fileId);
+              const fileName = file.getName();
+              const textContent = this._extractTextFromFile(file);
+              
+              if (textContent) {
+                  combinedContent += `--- 参考資料: ${fileName} ---\n${textContent}\n\n`;
+              }
+          } catch (e) {
+              Logger.log(`URLからのファイル読み込みに失敗しました: ${url}, Error: ${e.message}`);
+          }
+      }
+      return combinedContent;
+  }
+
+  _extractFileIdFromUrl(url) {
+      if (!url) return null;
+      const match = url.match(/\/d\/([a-zA-Z0-9_-]{28,})/);
+      return match ? match[1] : null;
+  }
+
+  _extractTextFromFile(file) {
+      const mimeType = file.getMimeType();
+      const fileName = file.getName();
+      Logger.log(`ファイルからテキストを抽出中: ${fileName} (MIME Type: ${mimeType})`);
+
+      try {
+        switch (mimeType) {
+            case MimeType.GOOGLE_DOCS:
+                return DocumentApp.openById(file.getId()).getBody().getText();
+            case MimeType.GOOGLE_SHEETS:
+                const sheet = SpreadsheetApp.openById(file.getId());
+                return sheet.getSheets().map(s => {
+                    const sheetName = s.getName();
+                    const data = s.getDataRange().getValues().map(row => row.join(', ')).join('\n');
+                    return `シート名: ${sheetName}\n${data}`;
+                }).join('\n\n');
+            case MimeType.GOOGLE_SLIDES:
+                 const presentation = SlidesApp.openById(file.getId());
+                 return presentation.getSlides().map((slide, index) => {
+                     const notes = slide.getNotesPage().getSpeakerNotesShape().getText().asString();
+                     const slideText = slide.getShapes().map(shape => shape.getText().asString()).join(' ');
+                     return `スライド ${index + 1}:\n${slideText}\nノート: ${notes}`;
+                 }).join('\n\n');
+            case MimeType.PLAIN_TEXT:
+            case 'text/csv':
+                return file.getBlob().getDataAsString('UTF-8');
+            case 'application/pdf':
+                if (Drive.Files) { 
+                    Logger.log(`PDFのOCR処理を開始します: ${fileName}`);
+                    const tempDoc = Drive.Files.insert({ title: `temp_ocr_${Utilities.getUuid()}` }, file.getBlob(), { ocr: true, ocrLanguage: 'ja' });
+                    const text = DocumentApp.openById(tempDoc.id).getBody().getText();
+                    Drive.Files.remove(tempDoc.id); 
+                    return text;
+                } else {
+                    Logger.log("PDFの読み込みにはDrive APIの有効化が必要です。");
+                    return '';
+                }
+            default:
+                Logger.log(`サポートされていないMIMEタイプのためスキップ: ${mimeType}`);
+                return '';
+        }
+      } catch (e) {
+        Logger.log(`ファイルからのテキスト抽出中にエラーが発生しました: ${fileName}, Error: ${e.message}`);
+        return '';
+      }
+  }
+
   _getCompanyInfo(companyName) {
     try {
         const researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
@@ -228,27 +366,12 @@ class SalesCopilot {
         return info;
     } catch (e) {
         Logger.log(`企業情報の調査中にエラーが発生しました: ${e.message}`);
-        return ''; // エラー時は空文字を返す
+        return '';
     }
   }
 
-
-  /**
-   * AIからのレスポンスを{suggest_ai_text, subject, body}の形式に整形します。
-   * @private
-   */
   _formatResponse(rawText, useGoogleSearch, contactMethod) {
-    // Google検索を利用したかどうかに関わらず、レスポンスの形式が統一されているため、
-    // 整形ロジックは一つにまとめることができる。
-    // ただし、検索時と非検索時でAIの応答の仕方が変わる可能性を考慮し、ロジックは分離しておく。
-    if (useGoogleSearch) {
-      Logger.log("Google検索結果を含むテキストを整形します...");
-      // 二次的な整形は、検索結果がうまく反映されなかった場合にのみ有効。
-      // 今回は`_buildFinalPrompt`で情報を渡しているため、通常の分割ロジックで対応可能。
-      return this._splitSubjectAndBody(rawText, contactMethod);
-    } else {
-      return this._splitSubjectAndBody(rawText, contactMethod);
-    }
+    return this._splitSubjectAndBody(rawText, contactMethod);
   }
 
   _getAppSheetClient() {
@@ -267,10 +390,6 @@ class SalesCopilot {
     }
   }
 
-  /**
-   * テキストを件名と本文に分割します。
-   * @private
-   */
   _splitSubjectAndBody(text, contactMethod) {
     const response = { "suggest_ai_text": text, "subject": "", "body": text };
 
@@ -327,7 +446,7 @@ class SalesCopilot {
     return { id: null, description: `推奨アクション: ${nextActionName}` };
   }
 
-  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '') {
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '') {
     let finalPrompt = template;
 
     for (const key in placeholders) {
@@ -359,8 +478,20 @@ class SalesCopilot {
         additionalInfo += `- 契約の確度: ${placeholders['[契約の確度]']}\n`;
         hasInfo = true;
     }
+    if (placeholders['[イベント名]']) {
+        additionalInfo += `- 交換場所/イベント名: ${placeholders['[イベント名]']}\n`;
+        hasInfo = true;
+    }
+    if (placeholders['[自社情報]']) {
+        additionalInfo += `\n--- 自社情報 ---\n${placeholders['[自社情報]']}\n`;
+        hasInfo = true;
+    }
     if (companyInfo) {
         additionalInfo += `\n--- 企業調査情報 ---\n${companyInfo}\n`;
+        hasInfo = true;
+    }
+    if (referenceContent) {
+        additionalInfo += `\n--- 参考資料の内容 ---\n${referenceContent}\n`;
         hasInfo = true;
     }
 
