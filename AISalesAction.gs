@@ -1,10 +1,11 @@
+// feat: 商談履歴のAI要約機能を追加し、URLを自動でMarkdownリンクに変換するよう強化。
 /**
  * =================================================================
- * AI Sales Action (完成版 v28)
+ * AI Sales Action (完成版 v31)
  * =================================================================
  * これまでの機能に加え、URL処理と件名抽出ロジックを大幅に改善しました。
  *
- * 【v28での主な変更点】
+ * 【v31での主な変更点】
  * - AIへの指示をより明確化し、参考資料のリンクが複数ある場合に、
  * そのすべてを生成する本文に含めるようにプロンプトを強化しました。
  * =================================================================
@@ -633,7 +634,7 @@ class SalesCopilot {
    * @param {string} [markdownLinks=''] - 参考資料のMarkdownリンクリスト。
    * @returns {string} - 完成した最終プロンプト。
    */
-  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '') {
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '', markdownLinks = '') {
     let finalPrompt = template;
 
     for (const key in placeholders) {
@@ -681,6 +682,10 @@ class SalesCopilot {
         additionalInfo += `\n--- 参考資料の内容 ---\n${referenceContent}\n`;
         hasInfo = true;
     }
+    if (markdownLinks) {
+        additionalInfo += `\n--- 利用可能な参考資料リンク ---\n${markdownLinks}\n`;
+        hasInfo = true;
+    }
     if (historySummary) {
         additionalInfo += `\n--- これまでの商談履歴の要約 ---\n${historySummary}\n`;
         hasInfo = true;
@@ -696,7 +701,7 @@ class SalesCopilot {
 
 
     if (contactMethod === 'メール') {
-        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
+        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 本文は、読みやすさを向上させるため、必要に応じて太字（**テキスト**）や箇条書き（- テキスト）などのMarkdown形式で記述してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 「利用可能な参考資料リンク」セクションに記載されているMarkdownリンク（[ファイル名](URL)の形式）は、すべて本文中に自然な形で含めてください。リンクのテキスト（ファイル名）とURLは、提供されたものをそのまま使用してください。\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
     }
 
     return finalPrompt;
