@@ -1,13 +1,14 @@
 /**
  * =================================================================
- * AI Sales Action (商談履歴の要約機能付き v23)
+ * AI Sales Action (動画・リンク挿入対応版 v25)
  * =================================================================
- * これまでの機能に加え、過去の商談履歴をAIが要約し、その内容を
- * 次のアクション提案に活かす機能を実装しました。
+ * これまでの機能に加え、参考資料の扱いを強化しました。
  *
- * 【v23での主な変更点】
- * - 可読性とメンテナンス性向上のため、すべての主要な関数とメソッドに
- * JSDoc形式の詳細なコメントを追加しました。
+ * 【v25での主な変更点】
+ * - Google DriveのURLから「ファイル内容」と「Markdownリンク」の両方を同時に
+ * 取得する `_fetchContentAndLinksFromUrls` 関数を実装しました。
+ * - AIへのプロンプトを改善し、ファイル内容を理解させると同時に、
+ * そのファイルのリンクを生成する文章内に含めるよう指示する仕組みを追加しました。
  * =================================================================
  */
 
@@ -26,7 +27,6 @@ const MASTER_SHEET_NAMES = {
 
 /**
  * 【AppSheetから実行】AIによる文章生成のメインプロセスを開始します。
- * AppSheetのAutomationから呼び出されることを想定しています。
  * @param {string} recordId - AIによる提案を記録するSalesActionレコードのID。
  * @param {string} organizationId - 組織ID（現在は未使用ですが、将来の拡張用）。
  * @param {string} accountId - アカウントID（現在は未使用ですが、将来の拡張用）。
@@ -99,34 +99,30 @@ function suggestNextAction(completedActionId, execUserEmail) {
 function test_executeAISalesAction() {
     const recordId = '7FBCF696-7397-49A3-BC8C-7E5E3AB3AAB4'; // テスト用のレコードID
     const AIRoleName = 'AI 営業マン';
-    const actionName = 'あいさつ';
+    const actionName = '事例紹介';
     const contactMethod = 'メール';
-    const mainPrompt = `初めて連絡する顧客へ、丁寧な自己紹介と簡潔な挨拶のメール文面を作成してください。件名も提案してください。
-Output Example
-[会社名]
-[氏名] 様
+    const mainPrompt = `[顧客の会社名]の[取引先担当者名]様
 
-株式会社ペーパーカンパニーＡのAlpacaAppSheetです。
-[イベント名]では、お忙しい中お名刺交換させていただき、誠にありがとうございました。
+いつもお世話になっております。
+株式会社〇〇の[自社担当者名]です。
 
 [商談メモの内容を加味した、1言メッセージ]
 
-まだまだ小さな会社ではありますが、経営の効率化や、将来を見据えた体制づくりについて、何かお役に立てることがあるかもしれません。
+つきましては、貴社と同様の課題をお持ちだった企業の成功事例をご紹介する資料をお送りいたします。
+添付の資料が、貴社の課題解決の一助となれば幸いです。
 
-まずは御礼まで。
-貴重なご縁をありがとうございました。
-
-今後ともどうぞよろしくお願いいたします。`;
-    const addPrompt = `ドキュパカに興味ありとのこと。参考資料はこちらです。https://docs.google.com/document/d/1mCjPNOHvhKLohepguS3bt9E3NEKhNCNVPr7B9MDyPdQ/edit`;
+ご不明な点がございましたら、お気軽にお申し付けください。
+`;
+    const addPrompt = `先日お話しした件について、参考動画をお送りします。`;
     const companyName = '株式会社テスト';
     const companyAddress = '東京都千代田区1-1-1';
     const customerContactName = '山田 太郎';
     const ourContactName = '鈴木 一郎';
     const probability = 'A';
-    const eventName = 'ものづくり産業交流展示会';
-    const ourCompanyInfoText = '弊社はAIを活用したドキュメント管理ツール「ドキュパカ」を提供しており、製造業のDXを支援します。主な製品は「ドキュパカ-Lite」「ドキュパカ-Pro」です。';
+    const eventName = '';
+    const ourCompanyInfoText = '';
     const ourCompanyInfoFileId = '';
-    const referenceUrls = '';
+    const referenceUrls = 'https://drive.google.com/file/d/1kl8_Ly-lFB8pmIxrb6Yhi7oaJPns0gK1/view?usp=sharing'; // ★実際にテストする動画のURL
     const execUserEmail = 'hello@al-pa-ca.com';
 
     Logger.log("以下のパラメータでテスト実行します:");
@@ -225,10 +221,10 @@ class SalesCopilot {
         companyInfo = this._getCompanyInfo(companyName);
       }
       
-      const referenceContent = this._fetchContentFromDriveUrls(referenceUrls);
+      const { content: referenceContent, markdownLinks } = this._fetchContentAndLinksFromUrls(referenceUrls);
 
       const template = mainPrompt || actionDetails.prompt;
-      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent, historySummary);
+      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent, historySummary, markdownLinks);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient('gemini-1.5-flash-latest');
@@ -370,16 +366,17 @@ class SalesCopilot {
   }
   
   /**
-   * カンマ区切りのGoogle Drive URL文字列から各ファイルの内容を読み込み、結合します。
+   * カンマ区切りのGoogle Drive URLからファイル内容とMarkdownリンクを取得します。
    * @private
    * @param {string} urlsString - カンマ区切りのURL文字列。
-   * @returns {string} - 各ファイルの内容を結合したテキスト。
+   * @returns {{content: string, markdownLinks: string}} - 抽出した内容とリンクのオブジェクト。
    */
-  _fetchContentFromDriveUrls(urlsString) {
-      if (!urlsString) return '';
+  _fetchContentAndLinksFromUrls(urlsString) {
+      if (!urlsString) return { content: '', markdownLinks: '' };
       
       const urls = urlsString.split(',').map(url => url.trim()).filter(url => url);
       let combinedContent = '';
+      const markdownLinkArray = [];
       
       for (const url of urls) {
           try {
@@ -393,11 +390,12 @@ class SalesCopilot {
               if (textContent) {
                   combinedContent += `--- 参考資料: ${fileName} ---\n${textContent}\n\n`;
               }
+              markdownLinkArray.push(`[${fileName}](${url})`);
           } catch (e) {
               Logger.log(`URLからのファイル読み込みに失敗しました: ${url}, Error: ${e.message}`);
           }
       }
-      return combinedContent;
+      return { content: combinedContent, markdownLinks: markdownLinkArray.join('\n') };
   }
 
   /**
@@ -413,10 +411,10 @@ class SalesCopilot {
   }
 
   /**
-   * Google Driveのファイルオブジェクトからテキスト内容を抽出します。
+   * Google Driveのファイルオブジェクトからテキスト内容を抽出します。動画ファイルにも対応。
    * @private
    * @param {GoogleAppsScript.Drive.File} file - テキストを抽出するファイルオブジェクト。
-   * @returns {string} - 抽出されたテキスト。
+   * @returns {string} - 抽出されたテキスト、または動画ファイルの場合は説明文。
    */
   _extractTextFromFile(file) {
       const mimeType = file.getMimeType();
@@ -424,6 +422,10 @@ class SalesCopilot {
       Logger.log(`ファイルからテキストを抽出中: ${fileName} (MIME Type: ${mimeType})`);
 
       try {
+        if (mimeType.startsWith('video/')) {
+          return `（ファイル名: 「${fileName}」の動画ファイル）`;
+        }
+        
         switch (mimeType) {
             case MimeType.GOOGLE_DOCS:
                 return DocumentApp.openById(file.getId()).getBody().getText();
@@ -457,7 +459,7 @@ class SalesCopilot {
                 }
             default:
                 Logger.log(`サポートされていないMIMEタイプのためスキップ: ${mimeType}`);
-                return '';
+                return `（ファイル名: 「${fileName}」、種類: ${mimeType}）`;
         }
       } catch (e) {
         Logger.log(`ファイルからのテキスト抽出中にエラーが発生しました: ${fileName}, Error: ${e.message}`);
@@ -626,9 +628,10 @@ class SalesCopilot {
    * @param {string} [companyInfo=''] - Google検索で得た企業情報。
    * @param {string} [referenceContent=''] - Google Driveファイルから読み込んだ参考情報。
    * @param {string} [historySummary=''] - AIが要約した過去の商談履歴。
+   * @param {string} [markdownLinks=''] - 参考資料のMarkdownリンクリスト。
    * @returns {string} - 完成した最終プロンプト。
    */
-  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '') {
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '', markdownLinks = '') {
     let finalPrompt = template;
 
     for (const key in placeholders) {
@@ -676,6 +679,10 @@ class SalesCopilot {
         additionalInfo += `\n--- 参考資料の内容 ---\n${referenceContent}\n`;
         hasInfo = true;
     }
+     if (markdownLinks) {
+        additionalInfo += `\n--- 利用可能な参考資料リンク ---\n${markdownLinks}\n`;
+        hasInfo = true;
+    }
     if (historySummary) {
         additionalInfo += `\n--- これまでの商談履歴の要約 ---\n${historySummary}\n`;
         hasInfo = true;
@@ -691,7 +698,7 @@ class SalesCopilot {
 
 
     if (contactMethod === 'メール') {
-        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
+        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 「利用可能な参考資料リンク」がある場合、それらのリンクを本文中に自然な形で含めてください。\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
     }
 
     return finalPrompt;
