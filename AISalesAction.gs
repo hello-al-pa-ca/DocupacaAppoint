@@ -1,16 +1,13 @@
 /**
  * =================================================================
- * AI Sales Action (RAG機能除外・レスポンス整形機能強化版 v19)
+ * AI Sales Action (商談履歴の要約機能付き v23)
  * =================================================================
- * 既存の AISalesAction.gs からRAG (Retrieval-Augmented Generation)
- * に関連する機能をすべて削除し、リファクタリングしたバージョンです。
+ * これまでの機能に加え、過去の商談履歴をAIが要約し、その内容を
+ * 次のアクション提案に活かす機能を実装しました。
  *
- * 主な変更点:
- * - SalesCopilotクラスを、AIによる文章生成と次アクション提案のコア機能に特化。
- * - Google検索のロジックを「企業調査→本文生成」の2段階に変更。
- * - addPrompt内のGoogle Drive URLを自動で検出し、Markdownリンクに変換する機能を統合。
- * - 【v19での修正】ご指摘に基づき、execUserEmailが空の場合にセッションから自動取得する
- * フォールバック処理を削除しました。execUserEmailは必須の引数となります。
+ * 【v23での主な変更点】
+ * - 可読性とメンテナンス性向上のため、すべての主要な関数とメソッドに
+ * JSDoc形式の詳細なコメントを追加しました。
  * =================================================================
  */
 
@@ -28,7 +25,26 @@ const MASTER_SHEET_NAMES = {
 // =================================================================
 
 /**
- * 【AppSheetから実行】AIによる文章生成を指示します。
+ * 【AppSheetから実行】AIによる文章生成のメインプロセスを開始します。
+ * AppSheetのAutomationから呼び出されることを想定しています。
+ * @param {string} recordId - AIによる提案を記録するSalesActionレコードのID。
+ * @param {string} organizationId - 組織ID（現在は未使用ですが、将来の拡張用）。
+ * @param {string} accountId - アカウントID（現在は未使用ですが、将来の拡張用）。
+ * @param {string} AIRoleName - 使用するAIの役割名（例: 'AI 営業マン'）。
+ * @param {string} actionName - 実行するアクションの名称（例: 'あいさつ'）。
+ * @param {string} contactMethod - 接触方法（例: 'メール', '電話'）。
+ * @param {string} mainPrompt - AIに渡すメインの指示やテンプレート。
+ * @param {string} addPrompt - ユーザーが追記する自由記述の指示やメモ。
+ * @param {string} [companyName=''] - 顧客の会社名。
+ * @param {string} [companyAddress=''] - 顧客の住所。
+ * @param {string} [customerContactName=''] - 顧客の担当者名。
+ * @param {string} [ourContactName=''] - 自社の担当者名。
+ * @param {string} [probability=''] - 契約の確度。
+ * @param {string} [eventName=''] - 名刺交換などをしたイベント名。
+ * @param {string} [ourCompanyInfoText=''] - テキスト形式の自社情報。
+ * @param {string} [ourCompanyInfoFileId=''] - ファイル形式の自社情報のGoogle DriveファイルID。
+ * @param {string} [referenceUrls=''] - 参考にするGoogle DriveのファイルURL（カンマ区切りで複数可）。
+ * @param {string} execUserEmail - このスクリプトを実行するユーザーのメールアドレス。
  */
 function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', customerContactName = '', ourContactName = '', probability = '', eventName = '', ourCompanyInfoText = '', ourCompanyInfoFileId = '', referenceUrls = '', execUserEmail) {
   
@@ -59,7 +75,9 @@ function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, a
 }
 
 /**
- * 【AppSheetから実行】アクションの結果に基づき、次のアクションを提案します。
+ * 【AppSheetから実行】完了したアクションに基づき、次のアクションを提案します。
+ * @param {string} completedActionId - 結果が記録されたSalesActionレコードのID。
+ * @param {string} execUserEmail - このスクリプトを実行するユーザーのメールアドレス。
  */
 function suggestNextAction(completedActionId, execUserEmail) {
   try {
@@ -75,7 +93,8 @@ function suggestNextAction(completedActionId, execUserEmail) {
 // =================================================================
 
 /**
- * 【エディタ実行用】固定引数でexecuteAISalesActionをテストします。
+ * 【エディタ実行用】固定の引数を使ってexecuteAISalesActionをテストします。
+ * 開発時にこの関数を実行して、メイン機能の動作確認を行います。
  */
 function test_executeAISalesAction() {
     const recordId = '7FBCF696-7397-49A3-BC8C-7E5E3AB3AAB4'; // テスト用のレコードID
@@ -120,14 +139,19 @@ Output Example
 // =================================================================
 // SalesCopilot クラス (メインのアプリケーションロジック)
 // =================================================================
+
+/**
+ * AI営業支援機能のメインロジックを管理するクラス。
+ * @class
+ */
 class SalesCopilot {
   /**
-   * @constructor
-   * @param {string} execUserEmail - 実行ユーザーのメールアドレス
+   * SalesCopilotのインスタンスを初期化します。
+   * 必要なクライアントの準備や、マスターデータの読み込みを行います。
+   * @param {string} execUserEmail - スクリプトを実行するユーザーのメールアドレス。
    */
   constructor(execUserEmail) {
     if (!execUserEmail) {
-      // このコンストラクタは有効なメールアドレスが渡されることを前提とする
       throw new Error("SalesCopilotの初期化に失敗: 実行ユーザーのメールアドレスは必須です。");
     }
 
@@ -144,7 +168,22 @@ class SalesCopilot {
   }
 
   /**
-   * AIによる営業アクションの文章を生成し、AppSheetを更新します。
+   * AIによる営業アクションの文章を生成し、結果をAppSheetのレコードに書き込みます。
+   * @param {string} recordId - AIによる提案を記録するSalesActionレコードのID。
+   * @param {string} AIRoleName - 使用するAIの役割名。
+   * @param {string} actionName - 実行するアクションの名称。
+   * @param {string} contactMethod - 接触方法。
+   * @param {string} mainPrompt - AIに渡すメインの指示やテンプレート。
+   * @param {string} addPrompt - ユーザーが追記する自由記述の指示やメモ。
+   * @param {string} companyName - 顧客の会社名。
+   * @param {string} companyAddress - 顧客の住所。
+   * @param {string} customerContactName - 顧客の担当者名。
+   * @param {string} ourContactName - 自社の担当者名。
+   * @param {string} probability - 契約の確度。
+   * @param {string} eventName - 名刺交換などをしたイベント名。
+   * @param {string} ourCompanyInfoText - テキスト形式の自社情報。
+   * @param {string} ourCompanyInfoFileId - ファイル形式の自社情報のGoogle DriveファイルID。
+   * @param {string} referenceUrls - 参考にするGoogle DriveのファイルURL（カンマ区切りで複数可）。
    */
   executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, ourCompanyInfoText, ourCompanyInfoFileId, referenceUrls) {
     try {
@@ -154,6 +193,14 @@ class SalesCopilot {
       const aiRoleDescription = this._getAIRoleDescription(AIRoleName);
       if (!aiRoleDescription) throw new Error(`AI役割定義が見つかりません: ${AIRoleName}`);
       
+      const currentAction = this._findRecordById('SalesAction', recordId);
+      const customerId = currentAction ? currentAction.取引先ID : null;
+
+      let historySummary = '';
+      if (customerId) {
+        historySummary = this._summarizePastActions(customerId, recordId);
+      }
+
       const processedAddPrompt = this._processAddPromptWithMarkdownLinks(addPrompt);
 
       const placeholders = {
@@ -181,7 +228,7 @@ class SalesCopilot {
       const referenceContent = this._fetchContentFromDriveUrls(referenceUrls);
 
       const template = mainPrompt || actionDetails.prompt;
-      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent);
+      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent, historySummary);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient('gemini-1.5-flash-latest');
@@ -223,7 +270,8 @@ class SalesCopilot {
   }
 
   /**
-   * 完了したアクションに基づき、次のアクションを提案します。
+   * 完了したアクションの結果に基づき、次のアクションを提案します。
+   * @param {string} completedActionId - 結果が記録されたSalesActionレコードのID。
    */
   suggestNextAction(completedActionId) {
     try {
@@ -249,6 +297,51 @@ class SalesCopilot {
 
   // --- プライベートヘルパーメソッド群 ---
 
+  /**
+   * 指定された顧客との過去のアクション履歴を取得し、AIに要約させます。
+   * @private
+   * @param {string} customerId - 顧客のID。
+   * @param {string} currentActionId - 現在処理中のアクションのID（履歴から除外するため）。
+   * @returns {string} - AIによって生成された履歴の要約テキスト。
+   */
+  _summarizePastActions(customerId, currentActionId) {
+    try {
+      Logger.log(`顧客ID [${customerId}] の過去の商談履歴の要約を開始します。`);
+      const selector = `FILTER("SalesAction", AND([取引先ID] = "${customerId}", [ID] <> "${currentActionId}"))`;
+      const pastActions = this.appSheetClient.findData('SalesAction', this.execUserEmail, { "Selector": selector });
+
+      if (!pastActions || pastActions.length === 0) {
+        Logger.log("要約対象の過去のアクションはありませんでした。");
+        return "";
+      }
+
+      const historyText = pastActions
+        .sort((a, b) => new Date(a.実施日時) - new Date(b.実施日時)) // 時系列にソート
+        .map(action => `日時: ${action.実施日時}\nアクション: ${action.action_name}\nメモ: ${action.addPrompt || ''}\n結果: ${action.result || ''}\nAI提案: ${action.body || ''}`)
+        .join('\n\n---\n\n');
+
+      const summarizationPrompt = `以下の商談履歴の要点を、重要なポイントを3行程度でまとめてください。\n\n--- 履歴 ---\n${historyText}`;
+      
+      const summarizerClient = new GeminiClient('gemini-1.5-flash-latest');
+      summarizerClient.setPromptText(summarizationPrompt);
+      const response = summarizerClient.generateCandidates();
+      const summary = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      
+      Logger.log(`商談履歴の要約:\n${summary}`);
+      return summary;
+
+    } catch (e) {
+      Logger.log(`商談履歴の要約中にエラーが発生しました: ${e.message}`);
+      return "";
+    }
+  }
+
+  /**
+   * addPrompt内のGoogle Drive URLをMarkdownリンクに変換します。
+   * @private
+   * @param {string} textBlock - URLを含む可能性のあるテキスト。
+   * @returns {string} - URLがMarkdownリンクに変換されたテキスト。
+   */
   _processAddPromptWithMarkdownLinks(textBlock) {
     if (!textBlock) return '';
 
@@ -276,6 +369,12 @@ class SalesCopilot {
     return processedText;
   }
   
+  /**
+   * カンマ区切りのGoogle Drive URL文字列から各ファイルの内容を読み込み、結合します。
+   * @private
+   * @param {string} urlsString - カンマ区切りのURL文字列。
+   * @returns {string} - 各ファイルの内容を結合したテキスト。
+   */
   _fetchContentFromDriveUrls(urlsString) {
       if (!urlsString) return '';
       
@@ -301,12 +400,24 @@ class SalesCopilot {
       return combinedContent;
   }
 
+  /**
+   * Google DriveのURLからファイルIDを抽出します。
+   * @private
+   * @param {string} url - Google DriveのURL。
+   * @returns {string|null} - 抽出されたファイルID。
+   */
   _extractFileIdFromUrl(url) {
       if (!url) return null;
       const match = url.match(/\/d\/([a-zA-Z0-9_-]{28,})/);
       return match ? match[1] : null;
   }
 
+  /**
+   * Google Driveのファイルオブジェクトからテキスト内容を抽出します。
+   * @private
+   * @param {GoogleAppsScript.Drive.File} file - テキストを抽出するファイルオブジェクト。
+   * @returns {string} - 抽出されたテキスト。
+   */
   _extractTextFromFile(file) {
       const mimeType = file.getMimeType();
       const fileName = file.getName();
@@ -354,6 +465,12 @@ class SalesCopilot {
       }
   }
 
+  /**
+   * Google検索を使って企業情報を調査します。
+   * @private
+   * @param {string} companyName - 調査対象の企業名。
+   * @returns {string} - AIによって要約された企業情報。
+   */
   _getCompanyInfo(companyName) {
     try {
         const researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
@@ -370,16 +487,36 @@ class SalesCopilot {
     }
   }
 
+  /**
+   * AIからの応答テキストを、件名と本文を含むオブジェクトに整形します。
+   * @private
+   * @param {string} rawText - AIからの生の応答テキスト。
+   * @param {boolean} useGoogleSearch - Google検索が使用されたかどうか。
+   * @param {string} contactMethod - 接触方法。
+   * @returns {{suggest_ai_text: string, subject: string, body: string}} - 整形されたオブジェクト。
+   */
   _formatResponse(rawText, useGoogleSearch, contactMethod) {
     return this._splitSubjectAndBody(rawText, contactMethod);
   }
 
+  /**
+   * AppSheet APIクライアントのインスタンスを取得します。
+   * @private
+   * @returns {AppSheetClient} - AppSheetClientのインスタンス。
+   */
   _getAppSheetClient() {
     const { APPSHEET_APP_ID, APPSHEET_API_KEY } = this.props;
     if (!APPSHEET_APP_ID || !APPSHEET_API_KEY) throw new Error('AppSheet接続情報(ID/Key)がスクリプトプロパティに設定されていません。');
     return new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY);
   }
 
+  /**
+   * マスターデータをスプレッドシートから読み込み、オブジェクトの配列に変換します。
+   * @private
+   * @param {string} sheetId - スプレッドシートのID。
+   * @param {string} sheetName - シート名。
+   * @returns {Object[]} - 読み込んだデータの配列。
+   */
   _loadSheetData(sheetId, sheetName) {
     try {
       const sheet = SpreadsheetApp.openById(sheetId).getSheetByName(sheetName);
@@ -390,6 +527,13 @@ class SalesCopilot {
     }
   }
 
+  /**
+   * テキストを【件名】と【本文】マーカーを元に分割します。
+   * @private
+   * @param {string} text - 分割対象のテキスト。
+   * @param {string} contactMethod - 接触方法。
+   * @returns {{suggest_ai_text: string, subject: string, body: string}} - 分割されたオブジェクト。
+   */
   _splitSubjectAndBody(text, contactMethod) {
     const response = { "suggest_ai_text": text, "subject": "", "body": text };
 
@@ -422,19 +566,46 @@ class SalesCopilot {
     return response;
   }
 
+  /**
+   * ActionCategoryシートから、指定されたアクション名と接触方法に一致する定義を取得します。
+   * @private
+   * @param {string} actionName - アクション名。
+   * @param {string} contactMethod - 接触方法。
+   * @returns {Object|null} - 見つかったアクション定義オブジェクト。
+   */
   _getActionDetails(actionName, contactMethod) {
     return this.actionCategories.find(row => row.action_name === actionName && row.contact_method === contactMethod) || null;
   }
 
+  /**
+   * AIRoleシートから、指定された役割名に一致する説明文（ペルソナ設定）を取得します。
+   * @private
+   * @param {string} roleName - AIの役割名。
+   * @returns {string} - AIの役割説明文。
+   */
   _getAIRoleDescription(roleName) {
     const role = this.aiRoles.find(row => row.name === roleName);
     return role ? role.description : `あなたは優秀な「${roleName}」です。`;
   }
 
+  /**
+   * ActionFlowシートから、現在の状況に一致する次のフロー定義を取得します。
+   * @private
+   * @param {string} currentProgress - 現在のステータス。
+   * @param {string} currentActionName - 実行されたアクション名。
+   * @param {string} currentResult - アクションの結果。
+   * @returns {Object|null} - 見つかったフロー定義オブジェクト。
+   */
   _getActionFlowDetails(currentProgress, currentActionName, currentResult) {
     return this.salesFlows.find(row => row.progress === currentProgress && row.action_id === currentActionName && row.result === currentResult) || null;
   }
 
+  /**
+   * 次のアクション名から、具体的なアクション情報を検索します。
+   * @private
+   * @param {string} nextActionName - 次に実行すべきアクションの名前。
+   * @returns {{id: string|null, description: string}} - 次のアクションのIDと説明文。
+   */
   _findNextActionInfo(nextActionName) {
     const defaultContactMethod = 'メール';
     const nextAction = this.actionCategories.find(row => row.action_name === nextActionName && row.contact_method === defaultContactMethod)
@@ -446,7 +617,18 @@ class SalesCopilot {
     return { id: null, description: `推奨アクション: ${nextActionName}` };
   }
 
-  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '') {
+  /**
+   * すべての情報を統合し、AIに渡す最終的なプロンプトを組み立てます。
+   * @private
+   * @param {string} template - プロンプトのテンプレート。
+   * @param {Object} placeholders - テンプレートに埋め込むプレースホルダーの値。
+   * @param {string} contactMethod - 接触方法。
+   * @param {string} [companyInfo=''] - Google検索で得た企業情報。
+   * @param {string} [referenceContent=''] - Google Driveファイルから読み込んだ参考情報。
+   * @param {string} [historySummary=''] - AIが要約した過去の商談履歴。
+   * @returns {string} - 完成した最終プロンプト。
+   */
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '') {
     let finalPrompt = template;
 
     for (const key in placeholders) {
@@ -494,6 +676,10 @@ class SalesCopilot {
         additionalInfo += `\n--- 参考資料の内容 ---\n${referenceContent}\n`;
         hasInfo = true;
     }
+    if (historySummary) {
+        additionalInfo += `\n--- これまでの商談履歴の要約 ---\n${historySummary}\n`;
+        hasInfo = true;
+    }
 
 
     if(hasInfo){
@@ -505,19 +691,33 @@ class SalesCopilot {
 
 
     if (contactMethod === 'メール') {
-        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
+        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
     }
 
     return finalPrompt;
   }
 
+  /**
+   * 指定されたIDのAppSheetレコードを更新します。
+   * @private
+   * @param {string} recordId - 更新するレコードのID。
+   * @param {Object} fieldsToUpdate - 更新するフィールドのキーと値。
+   * @returns {Object} - AppSheet APIからの応答。
+   */
   _updateAppSheetRecord(recordId, fieldsToUpdate) {
     const recordData = { "ID": recordId, ...fieldsToUpdate };
     return this.appSheetClient.updateRecords('SalesAction', [recordData], this.execUserEmail);
   }
 
+  /**
+   * 指定されたIDのレコードをAppSheetテーブルから検索します。
+   * @private
+   * @param {string} tableName - 検索対象のテーブル名。
+   * @param {string} recordId - 検索するレコードのID。
+   * @returns {Object|null} - 見つかったレコードオブジェクト。
+   */
   _findRecordById(tableName, recordId) {
-    const selector = `SELECT([ID], [ID] = "${recordId}")`;
+    const selector = `SELECT(${tableName}[ID], [ID] = "${recordId}")`;
     const properties = { "Selector": selector };
     const result = this.appSheetClient.findData(tableName, this.execUserEmail, properties);
     if (result && result.length > 0) return result[0];
