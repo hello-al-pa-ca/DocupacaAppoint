@@ -1,14 +1,12 @@
 /**
  * =================================================================
- * AI Sales Action (動画・リンク挿入対応版 v25)
+ * AI Sales Action (完成版 v28)
  * =================================================================
- * これまでの機能に加え、参考資料の扱いを強化しました。
+ * これまでの機能に加え、URL処理と件名抽出ロジックを大幅に改善しました。
  *
- * 【v25での主な変更点】
- * - Google DriveのURLから「ファイル内容」と「Markdownリンク」の両方を同時に
- * 取得する `_fetchContentAndLinksFromUrls` 関数を実装しました。
- * - AIへのプロンプトを改善し、ファイル内容を理解させると同時に、
- * そのファイルのリンクを生成する文章内に含めるよう指示する仕組みを追加しました。
+ * 【v28での主な変更点】
+ * - AIへの指示をより明確化し、参考資料のリンクが複数ある場合に、
+ * そのすべてを生成する本文に含めるようにプロンプトを強化しました。
  * =================================================================
  */
 
@@ -113,7 +111,7 @@ function test_executeAISalesAction() {
 
 ご不明な点がございましたら、お気軽にお申し付けください。
 `;
-    const addPrompt = `先日お話しした件について、参考動画をお送りします。`;
+    const addPrompt = `先日お話しした件について、参考動画と資料をお送りします。https://drive.google.com/file/d/1kl8_Ly-lFB8pmIxrb6Yhi7oaJPns0gK1/view?usp=sharing`;
     const companyName = '株式会社テスト';
     const companyAddress = '東京都千代田区1-1-1';
     const customerContactName = '山田 太郎';
@@ -122,7 +120,7 @@ function test_executeAISalesAction() {
     const eventName = '';
     const ourCompanyInfoText = '';
     const ourCompanyInfoFileId = '';
-    const referenceUrls = 'https://drive.google.com/file/d/1kl8_Ly-lFB8pmIxrb6Yhi7oaJPns0gK1/view?usp=sharing'; // ★実際にテストする動画のURL
+    const referenceUrls = 'https://docs.google.com/document/d/1mCjPNOHvhKLohepguS3bt9E3NEKhNCNVPr7B9MDyPdQ/edit'; // 追加の参考資料
     const execUserEmail = 'hello@al-pa-ca.com';
 
     Logger.log("以下のパラメータでテスト実行します:");
@@ -197,7 +195,7 @@ class SalesCopilot {
         historySummary = this._summarizePastActions(customerId, recordId);
       }
 
-      const processedAddPrompt = this._processAddPromptWithMarkdownLinks(addPrompt);
+      const { processedAddPrompt, referenceContent, markdownLinkList } = this._processUrlInputs(addPrompt, referenceUrls);
 
       const placeholders = {
         '[商談メモの内容を加味した、1言メッセージ]': processedAddPrompt,
@@ -221,10 +219,8 @@ class SalesCopilot {
         companyInfo = this._getCompanyInfo(companyName);
       }
       
-      const { content: referenceContent, markdownLinks } = this._fetchContentAndLinksFromUrls(referenceUrls);
-
       const template = mainPrompt || actionDetails.prompt;
-      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent, historySummary, markdownLinks);
+      const finalPrompt = this._buildFinalPrompt(template, placeholders, contactMethod, companyInfo, referenceContent, historySummary, markdownLinkList);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient('gemini-1.5-flash-latest');
@@ -248,11 +244,13 @@ class SalesCopilot {
 
       const formattedData = this._formatResponse(generatedText, useGoogleSearch, contactMethod);
       
+      // AppSheetに更新するペイロードを作成
       const updatePayload = {
           "suggest_ai_text": formattedData.suggest_ai_text,
           "subject": formattedData.subject,
           "body": formattedData.body,
-          "execute_ai_status": "提案済み"
+          "execute_ai_status": "提案済み",
+          "link_markdown": markdownLinkList
       };
       
       Logger.log(`更新ペイロード: ${JSON.stringify(updatePayload)}`);
@@ -333,71 +331,65 @@ class SalesCopilot {
   }
 
   /**
-   * addPrompt内のGoogle Drive URLをMarkdownリンクに変換します。
+   * `addPrompt`と`referenceUrls`からURLを処理し、整形済みテキスト、ファイル内容、Markdownリンクリストを生成します。
    * @private
-   * @param {string} textBlock - URLを含む可能性のあるテキスト。
-   * @returns {string} - URLがMarkdownリンクに変換されたテキスト。
+   * @param {string} addPrompt - ユーザーが追記する自由記述の指示やメモ。
+   * @param {string} referenceUrls - 参考にするGoogle DriveのファイルURL（カンマ区切りで複数可）。
+   * @returns {{processedAddPrompt: string, referenceContent: string, markdownLinkList: string}} - 処理結果のオブジェクト。
    */
-  _processAddPromptWithMarkdownLinks(textBlock) {
-    if (!textBlock) return '';
-
+  _processUrlInputs(addPrompt, referenceUrls) {
+    const combinedUrlsString = [addPrompt, referenceUrls].filter(Boolean).join(',');
     const urlRegex = /https?:\/\/(?:drive|docs)\.google\.com\/(?:file|document|spreadsheets|presentation)\/d\/([a-zA-Z0-9_-]{28,})/g;
-    const uniqueUrls = [...new Set(textBlock.match(urlRegex) || [])];
-    
+    const uniqueUrls = [...new Set(combinedUrlsString.match(urlRegex) || [])];
+
     if (uniqueUrls.length === 0) {
-        return textBlock;
+      return {
+        processedAddPrompt: addPrompt,
+        referenceContent: '',
+        markdownLinkList: ''
+      };
     }
 
-    let processedText = textBlock;
+    let processedAddPromptText = addPrompt || '';
+    let referenceContentText = '';
+    const markdownLinkArray = [];
+
     uniqueUrls.forEach(url => {
-        try {
-            const fileId = this._extractFileIdFromUrl(url);
-            if (!fileId) return;
-            const fileName = DriveApp.getFileById(fileId).getName();
-            const markdownLink = `[${fileName}](${url})`;
-            const urlPattern = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-            processedText = processedText.replace(urlPattern, markdownLink);
-        } catch (e) {
-            Logger.log(`Error processing URL [${url}] for markdown link: ${e.message}`);
+      try {
+        const fileId = this._extractFileIdFromUrl(url);
+        if (!fileId) return;
+
+        const file = DriveApp.getFileById(fileId);
+        const fileName = file.getName();
+        const markdownLink = `[${fileName}](${url})`;
+
+        // 1. Markdownリンクリストに追加
+        markdownLinkArray.push(markdownLink);
+        
+        // 2. ファイル内容を抽出してAIへの参考情報に追加
+        const textContent = this._extractTextFromFile(file);
+        if (textContent) {
+          referenceContentText += `--- 参考資料: ${fileName} ---\n${textContent}\n\n`;
         }
+
+        // 3. 元のaddPrompt内のURLをMarkdownリンクに置換
+        const urlPattern = new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+        if(processedAddPromptText.match(urlPattern)){
+            processedAddPromptText = processedAddPromptText.replace(urlPattern, markdownLink);
+        }
+
+      } catch (e) {
+        Logger.log(`URL処理中のエラー [${url}]: ${e.message}`);
+      }
     });
 
-    return processedText;
+    return {
+      processedAddPrompt: processedAddPromptText,
+      referenceContent: referenceContentText,
+      markdownLinkList: markdownLinkArray.join('\n')
+    };
   }
   
-  /**
-   * カンマ区切りのGoogle Drive URLからファイル内容とMarkdownリンクを取得します。
-   * @private
-   * @param {string} urlsString - カンマ区切りのURL文字列。
-   * @returns {{content: string, markdownLinks: string}} - 抽出した内容とリンクのオブジェクト。
-   */
-  _fetchContentAndLinksFromUrls(urlsString) {
-      if (!urlsString) return { content: '', markdownLinks: '' };
-      
-      const urls = urlsString.split(',').map(url => url.trim()).filter(url => url);
-      let combinedContent = '';
-      const markdownLinkArray = [];
-      
-      for (const url of urls) {
-          try {
-              const fileId = this._extractFileIdFromUrl(url);
-              if (!fileId) continue;
-              
-              const file = DriveApp.getFileById(fileId);
-              const fileName = file.getName();
-              const textContent = this._extractTextFromFile(file);
-              
-              if (textContent) {
-                  combinedContent += `--- 参考資料: ${fileName} ---\n${textContent}\n\n`;
-              }
-              markdownLinkArray.push(`[${fileName}](${url})`);
-          } catch (e) {
-              Logger.log(`URLからのファイル読み込みに失敗しました: ${url}, Error: ${e.message}`);
-          }
-      }
-      return { content: combinedContent, markdownLinks: markdownLinkArray.join('\n') };
-  }
-
   /**
    * Google DriveのURLからファイルIDを抽出します。
    * @private
@@ -546,14 +538,17 @@ class SalesCopilot {
       const subjectIndex = text.indexOf(subjectMarker);
       
       if (subjectIndex !== -1) {
+        // 【件名】マーカーがある場合
         const bodyIndex = text.indexOf(bodyMarker, subjectIndex);
         let subjectText = '';
         let bodyText = '';
 
         if (bodyIndex !== -1) {
+          // 【本文】マーカーもある
           subjectText = text.substring(subjectIndex + subjectMarker.length, bodyIndex).trim();
           bodyText = text.substring(bodyIndex + bodyMarker.length).trim();
         } else {
+          // 【件名】マーカーのみ
           const lines = text.substring(subjectIndex + subjectMarker.length).trim().split('\n');
           subjectText = lines.find(line => line.trim() !== '') || '';
           const subjectLineIndex = lines.findIndex(line => line === subjectText);
@@ -562,7 +557,14 @@ class SalesCopilot {
         
         response.subject = subjectText.replace(/[\r\n]/g, ' ').trim();
         response.body = bodyText;
-
+      } else {
+        // マーカーが全くない場合のフォールバック
+        const lines = text.trim().split('\n');
+        // 最初の行が50文字未満で、"様"や"こんにちは"を含まないなど、件名らしい場合
+        if (lines.length > 1 && lines[0].length < 50 && !lines[0].includes('様') && !lines[0].includes('こんにちは')) {
+            response.subject = lines[0].trim();
+            response.body = lines.slice(1).join('\n').trim();
+        }
       }
     }
     return response;
@@ -631,7 +633,7 @@ class SalesCopilot {
    * @param {string} [markdownLinks=''] - 参考資料のMarkdownリンクリスト。
    * @returns {string} - 完成した最終プロンプト。
    */
-  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '', markdownLinks = '') {
+  _buildFinalPrompt(template, placeholders, contactMethod, companyInfo = '', referenceContent = '', historySummary = '') {
     let finalPrompt = template;
 
     for (const key in placeholders) {
@@ -679,10 +681,6 @@ class SalesCopilot {
         additionalInfo += `\n--- 参考資料の内容 ---\n${referenceContent}\n`;
         hasInfo = true;
     }
-     if (markdownLinks) {
-        additionalInfo += `\n--- 利用可能な参考資料リンク ---\n${markdownLinks}\n`;
-        hasInfo = true;
-    }
     if (historySummary) {
         additionalInfo += `\n--- これまでの商談履歴の要約 ---\n${historySummary}\n`;
         hasInfo = true;
@@ -698,7 +696,7 @@ class SalesCopilot {
 
 
     if (contactMethod === 'メール') {
-        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 「利用可能な参考資料リンク」がある場合、それらのリンクを本文中に自然な形で含めてください。\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
+        finalPrompt += `\n\n【重要】\n- 必ず【件名】【本文】の形式で、メールやスクリプトの文章だけを生成してください。\n- 【補足情報】にある「企業調査情報」や「商談履歴の要約」を参考に、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。（例：「貴社の〇〇のニュース、興味深く拝見しました」「前回の〇〇の件、その後いかがでしょうか」など）\n- 件名は簡潔で分かりやすくしてください。\n- 生成する文章以外の解説や、確度に応じた文章の調整案などは一切含めないでください。`;
     }
 
     return finalPrompt;
