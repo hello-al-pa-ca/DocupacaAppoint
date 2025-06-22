@@ -1,58 +1,44 @@
 /**
- * @fileoverview AppSheetからトリガーされる名刺情報抽出・更新バックエンド (緯度経度取得対応)
- * @version 1.3.0
- * * @description
- * AppSheetから直接このスクリプトの'runBusinessCardExtraction'関数を呼び出して使用します。
- * 抽出した住所を元に、Google Mapsサービスを利用して正確な緯度・経度を取得し、AppSheetのレコードを更新します。
- * * @see
- * - AIへの指示(プロンプト)は、管理しやすいようにGoogleスプレッドシートから動的に読み込みます。
- * - 処理中にエラーが発生した場合、3回まで自動でリトライします。
- * - 最終的に失敗した場合は、AppSheetのステータスを更新して処理を終了します。
+ * @fileoverview AppSheetからトリガーされる名刺情報抽出・更新バックエンド (ドメイン判定によるアカウント連携強化版)
+ * @version 3.0.0
+ * @description
+ * 会社名での重複を防ぐため、メールアドレスのドメインを最優先で照合してアカウントを特定するロジックを実装。
+ * 存在しない場合は会社名でフォールバックし、それでも見つからなければドメイン情報と共に新規アカウントを作成します。
+ *
+ * 【v3.0.0での主な変更点】
+ * - アカウントを特定するロジックを「ドメイン優先、会社名がサブ」に変更。
+ * - Accountテーブルに`domain`列が追加されていることを前提とした実装。
+ * - `_findOrCreateAccount`をドメイン検索に対応するよう大幅に修正。
+ * - フリーメールのドメインを無視するヘルパー関数`_extractDomainFromEmail`を追加。
  */
 
 // =================================================================
 // ▼▼▼ 設定項目 (ご利用前に必ず設定してください) ▼▼▼
 // =================================================================
 
-/**
- * @const {string} APPSHEET_APP_ID - あなたのAppSheetアプリのID
- */
-const APPSHEET_APP_ID = PropertiesService.getScriptProperties().getProperty('APPSHEET_APP_ID') || 'APPSHEET_APP_ID';
+/** @const {string} APPSHEET_APP_ID - あなたのAppSheetアプリのID */
+const APPSHEET_APP_ID = PropertiesService.getScriptProperties().getProperty('APPSHEET_APP_ID') || 'YOUR_APPSHEET_APP_ID';
 
-/**
- * @const {string} APPSHEET_KEY_COLUMN_NAME - AppSheetテーブルの主キーとして使用する列の名前
- */
+/** @const {string} APPSHEET_KEY_COLUMN_NAME - BusinessCardテーブルの主キー列の名前 */
 const APPSHEET_KEY_COLUMN_NAME = 'id';
 
-/**
- * @const {string} APPSHEET_IMAGE_FOLDER_NAME - AppSheetがファイルを参照する際に使用するフォルダ名 (例: "テーブル名.Images")
- */
+/** @const {string} APPSHEET_IMAGE_FOLDER_NAME - AppSheetがファイルを参照する際に使用するフォルダ名 (例: "テーブル名.Images") */
 const APPSHEET_IMAGE_FOLDER_NAME = 'FileContents';
 
-/**
- * @const {string} APPSHEET_UPLOAD_FOLDER_ID - AppSheetがファイルをアップロードするGoogle DriveフォルダのID
- */
+/** @const {string} APPSHEET_UPLOAD_FOLDER_ID - AppSheetがファイルをアップロードするGoogle DriveフォルダのID */
 const APPSHEET_UPLOAD_FOLDER_ID = '1ihmiqnPVl7DSdNw5tQ9Z-XiKizmdUXkL';
 
-/**
- * @const {string} IMAGE_DESTINATION_FOLDER_ID - PDFから変換した画像を保存するGoogle DriveフォルダのID
- */
+/** @const {string} IMAGE_DESTINATION_FOLDER_ID - PDFから変換した画像を保存するGoogle DriveフォルダのID */
 const IMAGE_DESTINATION_FOLDER_ID = APPSHEET_UPLOAD_FOLDER_ID;
 
-/**
- * @const {string} SCHEMA_SPREADSHEET_ID - プロンプトのSchemaを定義しているGoogleスプレッドシートのID
- */
+/** @const {string} SCHEMA_SPREADSHEET_ID - プロンプトのSchemaを定義しているGoogleスプレッドシートのID */
 const SCHEMA_SPREADSHEET_ID = '129J3rU9h1QRU6dtvmRnElRPzhKHVmZy0JQaiHPAMLhs';
 
-/**
- * @const {string} SCHEMA_SHEET_NAME - Schemaが定義されているシートの名前
- */
+/** @const {string} SCHEMA_SHEET_NAME - Schemaが定義されているシートの名前 */
 const SCHEMA_SHEET_NAME = 'Schema';
 
-/**
- * @const {string} GEMINI_MODEL_NAME - データ抽出に使用するGeminiのモデル名
- */
-const GEMINI_MODEL_NAME = 'gemini-2.0-flash';
+/** @const {string} GEMINI_MODEL_NAME - データ抽出に使用するGeminiのモデル名 */
+const GEMINI_MODEL_NAME = 'gemini-1.5-flash-latest';
 
 
 // --- APIキー関連 (スクリプトプロパティでの設定を強く推奨します) ---
@@ -111,12 +97,12 @@ const PROMPT_USER_INSTRUCTION = `Follow the rules and the provided Schema below 
  * @param {string} fileNameFront - 表面のファイル名
  * @param {string} [fileNameBack] - 裏面のファイル名 (任意)
  * @param {string} [userEmail] - アクションを実行するユーザーのメールアドレス (任意)
- * @returns {{status: string, data: (Object|undefined), message: (string|undefined)}} 処理結果を示すオブジェクト
+ * @returns {Promise<{status: string, data: (Object|undefined), message: (string|undefined)}>} 処理結果を示すオブジェクト
  */
-function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameBack, userEmail) {
+async function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameBack, userEmail) {
   const MAX_RETRIES = 3;
   let lastError;
-  const execUser = userEmail || 'user@example.com'; 
+  const execUser = userEmail || Session.getActiveUser().getEmail() || 'appsheet-owner@example.com'; 
 
   // 処理全体を最大3回まで試行
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -131,7 +117,7 @@ function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameB
         throw new Error('tableName, recordIdが指定されていないか、指定されたファイル名が見つかりません。');
       }
 
-      const result = processBusinessCard(tableName, fileIds, recordId, execUser);
+      const result = await processBusinessCard(tableName, fileIds, recordId, execUser);
       console.log(`Attempt ${attempt} succeeded.`);
       return { status: 'success', data: result };
 
@@ -152,7 +138,7 @@ function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameB
       [APPSHEET_KEY_COLUMN_NAME]: recordId,
       importStatus: '解析に失敗しました。再抽出してください。'
     };
-    appSheetClient.updateRecords(tableName, [recordToUpdate], execUser);
+    await appSheetClient.updateRecords(tableName, [recordToUpdate], execUser);
     console.log(`Successfully updated recordId ${recordId} with failure status.`);
     return { status: 'error', message: `All attempts failed. Final error: ${lastError.message}` };
   } catch (updateError) {
@@ -171,13 +157,13 @@ function runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameB
  * @param {string[]} fileIds - 処理対象のファイルIDの配列
  * @param {string} recordId - AppSheetのレコードID
  * @param {string} execUser - 実行ユーザーのメールアドレス
- * @returns {{updatedData: Object}} 更新されたデータを含むオブジェクト
+ * @returns {Promise<{updatedData: Object}>} 更新されたデータを含むオブジェクト
  */
-function processBusinessCard(tableName, fileIds, recordId, execUser) {
+async function processBusinessCard(tableName, fileIds, recordId, execUser) {
   const destinationFolder = DriveApp.getFolderById(IMAGE_DESTINATION_FOLDER_ID);
   const processedImageFiles = [];
 
-  // --- 1. ファイル処理 ---
+  // --- 1. ファイル処理 (PDF -> PNG変換) ---
   fileIds.forEach((fileId, index) => {
     const originalFile = DriveApp.getFileById(fileId);
     let processedImageFile;
@@ -212,17 +198,20 @@ function processBusinessCard(tableName, fileIds, recordId, execUser) {
     throw new Error(`Geminiからの応答がJSON形式ではありません: ${textResponse}`);
   }
   console.log('データ抽出完了:', extractedData);
+
+  // --- 3. アカウントの検索または作成 ---
+  const appSheetClient = new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY);
+  const accountId = await _findOrCreateAccount(appSheetClient, extractedData, execUser);
   
-  // --- 3. 緯度・経度取得 (Google Maps Service) ---
+  // --- 4. 緯度・経度取得 (Google Maps Service) ---
   let location = { latitude: '', longitude: '' };
   if (extractedData.address) {
       location = getLatLngFromAddress_(extractedData.address);
       console.log(`緯度経度取得完了: lat=${location.latitude}, lng=${location.longitude}`);
   }
 
-  // --- 4. レコード更新 (AppSheet API) ---
+  // --- 5. レコード更新 (AppSheet API) ---
   console.log('AppSheetのレコード更新を開始します...');
-  const appSheetClient = new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY);
   const image_path_front = processedImageFiles[0] ? `${APPSHEET_IMAGE_FOLDER_NAME}/${processedImageFiles[0].getName()}` : "";
   const image_path_back = processedImageFiles[1] ? `${APPSHEET_IMAGE_FOLDER_NAME}/${processedImageFiles[1].getName()}` : "";
   const now = new Date();
@@ -231,6 +220,7 @@ function processBusinessCard(tableName, fileIds, recordId, execUser) {
   const recordToUpdate = {
     ...extractedData,
     [APPSHEET_KEY_COLUMN_NAME]: recordId,
+    account_id: accountId, 
     latitude: location.latitude,
     longitude: location.longitude,
     acquisitionDatetime: Utilities.formatDate(now, 'JST', 'yyyy/MM/dd HH:mm:ss'),
@@ -242,7 +232,7 @@ function processBusinessCard(tableName, fileIds, recordId, execUser) {
     recordToUpdate.gender = '';
   }
 
-  appSheetClient.updateRecords(tableName, [recordToUpdate], execUser);
+  await appSheetClient.updateRecords(tableName, [recordToUpdate], execUser);
   console.log('レコード更新が完了しました。');
   return { updatedData: recordToUpdate };
 }
@@ -253,6 +243,101 @@ function processBusinessCard(tableName, fileIds, recordId, execUser) {
 // =================================================================
 
 /**
+ * 会社名またはメールドメインを基にAccountテーブルを検索し、存在しない場合は新規作成する。
+ * @param {AppSheetClient} client - AppSheetClientのインスタンス。
+ * @param {Object} cardData - 名刺から抽出したデータ。
+ * @param {string} userEmail - 実行ユーザーのメールアドレス。
+ * @returns {Promise<string|null>} - 見つかった、または作成されたAccountのID。
+ * @private
+ */
+async function _findOrCreateAccount(client, cardData, userEmail) {
+  const companyName = cardData.companyName;
+  const domain = _extractDomainFromEmail(cardData.email);
+
+  if (!companyName && !domain) {
+    console.warn("会社名と有効なメールドメインの両方がないため、アカウント連携をスキップします。");
+    return null;
+  }
+  
+  try {
+    // 1. ドメインで既存アカウントを検索 (最優先)
+    if (domain) {
+      console.log(`ドメインでアカウントを検索中: ${domain}`);
+      const domainSelector = `FILTER("Account", [domain] = "${domain}")`;
+      const accountsByDomain = await client.findData("Account", userEmail, { "Selector": domainSelector });
+      if (accountsByDomain && accountsByDomain.length > 0) {
+        const existingAccountId = accountsByDomain[0].id;
+        console.log(`ドメインで既存のアカウントが見つかりました: ${existingAccountId}`);
+        return existingAccountId;
+      }
+    }
+
+    // 2. 会社名で既存アカウントを検索 (フォールバック)
+    if (companyName) {
+      console.log(`会社名でアカウントを検索中: ${companyName}`);
+      const nameSelector = `FILTER("Account", [name] = "${companyName}")`;
+      const accountsByName = await client.findData("Account", userEmail, { "Selector": nameSelector });
+      if (accountsByName && accountsByName.length > 0) {
+        const existingAccountId = accountsByName[0].id;
+        console.log(`会社名で既存のアカウントが見つかりました: ${existingAccountId}`);
+        return existingAccountId;
+      }
+    }
+
+    // 3. 新規アカウントを作成
+    console.log(`新規アカウントを作成します: ${companyName || domain}`);
+    const newAccountPayload = {
+      name: companyName,
+      domain: domain, // ★★★ ドメインも保存 ★★★
+      postal_code: cardData.postalCode,
+      address: cardData.address,
+      building_name: cardData.buildingName,
+      email: cardData.email,
+      phone_number: cardData.phoneNumber,
+      fax_number: cardData.faxNumber,
+      note: cardData.otherNotes,
+    };
+    
+    const addResponse = await client.addRecords("Account", [newAccountPayload], userEmail);
+    
+    // 応答から新しいレコードIDを取得する (成功した場合)
+    if (addResponse && addResponse.Rows && addResponse.Rows.length > 0 && addResponse.Rows[0].id) {
+        const newAccountId = addResponse.Rows[0].id;
+        console.log(`新規アカウントを作成しました: ${newAccountId}`);
+        return newAccountId;
+    } else {
+       throw new Error("新規アカウントの作成に成功しましたが、応答からIDを取得できませんでした。");
+    }
+  } catch (e) {
+    console.error(`アカウントの検索または作成中にエラーが発生しました: ${e.stack}`);
+    return null;
+  }
+}
+
+/**
+ * メールアドレスからドメインを抽出する。一般的なフリーメールは除外。
+ * @param {string} email - メールアドレス。
+ * @returns {string|null} - 抽出したドメイン、またはnull。
+ * @private
+ */
+function _extractDomainFromEmail(email) {
+  if (!email || !email.includes('@')) return null;
+  
+  const domain = email.split('@')[1];
+  const freeEmailDomains = [
+    'gmail.com', 'yahoo.co.jp', 'yahoo.com', 'hotmail.com', 'outlook.jp', 'outlook.com', 
+    'icloud.com', 'me.com', 'mac.com', 'aol.com', 'excite.co.jp'
+  ];
+
+  if (freeEmailDomains.includes(domain.toLowerCase())) {
+    return null; // フリーメールの場合はnullを返す
+  }
+  
+  return domain;
+}
+
+
+/**
  * 住所文字列から緯度・経度を取得する
  * @param {string} address - 変換したい住所
  * @returns {{latitude: number|string, longitude: number|string}} 緯度経度オブジェクト
@@ -260,11 +345,9 @@ function processBusinessCard(tableName, fileIds, recordId, execUser) {
  */
 function getLatLngFromAddress_(address) {
   try {
-    // Mapsのジオコーダーを呼び出し
     const geocoder = Maps.newGeocoder().setLanguage('ja');
     const response = geocoder.geocode(address);
     
-    // 結果が存在し、ステータスがOKの場合のみ値を返す
     if (response && response.status === 'OK' && response.results && response.results.length > 0) {
       const location = response.results[0].geometry.location;
       return {
@@ -286,8 +369,6 @@ function getLatLngFromAddress_(address) {
  * @private
  */
 function findFileIdByName(folderId, fileName) {
-  console.log(folderId)
-  console.log(fileName)
   if (!folderId || !fileName) return null;
   try {
     const folder = DriveApp.getFolderById(folderId);
@@ -338,8 +419,5 @@ function testProcess() {
   const fileNameBack = '';
   const userEmail = 'hello@al-pa-ca.com';
   
-  const result = runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameBack, userEmail);
-  console.log(JSON.stringify(result, null, 2));
+  runBusinessCardExtraction(tableName, recordId, fileNameFront, fileNameBack, userEmail);
 }
-
-
