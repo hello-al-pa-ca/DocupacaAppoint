@@ -1,14 +1,14 @@
 /**
  * =================================================================
- * AI Sales Action (リファクタリング版 v15)
+ * AI Sales Action (リファクタリング版 v22)
  * =================================================================
- * v14の改善に加え、AppSheetのレコードが見つからない404エラーを防止する
- * チェック処理を追加し、「引継ぎ資料」の情報をAIがより活用できるように
- * プロンプトを改善しました。
+ * v18をベースに、Gemini APIの一時的な高負荷(503エラー)に対応するため、
+ * 指数関数的バックオフを用いたリトライ機能を実装しました。
  *
- * 【v15での主な変更点】
- * - 処理開始時にレコードIDの存在チェックを追加し、404エラーを未然に防ぎます。
- * - 「引継ぎ資料」の内容をAIがより重視するようにプロンプトを修正。
+ * 【v22での主な変更点】
+ * - API呼び出しが5xxエラーで失敗した際に、待ち時間を指数関数的に増やして
+ * 再試行するよう`_apiCallWithRetry`関数を強化しました。
+ * - これにより、APIサーバーの一時的な高負荷に対する耐性が向上します。
  * =================================================================
  */
 
@@ -20,6 +20,11 @@ const MASTER_SHEET_NAMES = {
   aiRoles: 'AIRole',
   salesFlows: 'ActionFlow'
 };
+const RETRY_CONFIG = {
+  count: 3, // 最大リトライ回数
+  delay: 2000 // 初回のリトライ待機時間（ミリ秒）
+};
+
 
 // =================================================================
 // グローバル関数 (AppSheetまたは手動で実行)
@@ -48,7 +53,7 @@ function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, a
         "execute_ai_status": "エラー",
         "suggest_ai_text": errorMessage
       };
-      client.updateRecords('SalesAction', [errorPayload], null); // App Ownerとして実行
+      client.updateRecords('SalesAction', [errorPayload], null);
     } catch (updateError) {
       Logger.log(`❌ エラーステータスの更新に失敗しました: ${updateError.message}`);
     }
@@ -58,11 +63,11 @@ function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, a
   try {
     const copilot = new SalesCopilot(execUserEmail);
     // 非同期処理を呼び出し、エラーはcatchで補足
-    copilot.executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls)
+    copilot.executeAISalesAction(recordId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls)
       .catch(e => {
         Logger.log(`❌ executeAISalesActionの非同期実行中にエラー: ${e.message}\n${e.stack}`);
         // エラーが発生した場合も、ステータスを更新
-        copilot._updateAppSheetRecord(recordId, { "execute_ai_status": "エラー", "suggest_ai_text": `処理エラー: ${e.message}` });
+        copilot._updateAppSheetRecord('SalesAction', recordId, { "execute_ai_status": "エラー", "suggest_ai_text": `処理エラー: ${e.message}` });
       });
   } catch (e) {
     Logger.log(`❌ executeAISalesActionで致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
@@ -112,12 +117,11 @@ class SalesCopilot {
   /**
    * AIによる営業アクションの文章を生成します。
    */
-  async executeAISalesAction(recordId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls) {
+  async executeAISalesAction(recordId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls) {
     try {
-      // ★★★ 修正点: 処理開始時にレコードの存在を確認 ★★★
       const currentAction = await this._findRecordById('SalesAction', recordId);
       if (!currentAction) {
-        throw new Error(`指定されたSalesActionレコードが見つかりません (ID: ${recordId})。AppSheet側でレコードが作成されているか、IDが正しいか確認してください。`);
+        throw new Error(`指定されたSalesActionレコードが見つかりません (ID: ${recordId})。`);
       }
       
       const actionDetails = this._getActionDetails(actionName, contactMethod);
@@ -126,21 +130,19 @@ class SalesCopilot {
       const aiRoleDescription = this._getAIRoleDescription(AIRoleName);
       if (!aiRoleDescription) throw new Error(`AI役割定義が見つかりません: ${AIRoleName}`);
       
-      const customerId = currentAction.取引先ID;
+      const customerId = accountId;
 
       const organizationRecord = organizationId ? await this._findRecordById('Organization', organizationId) : null;
-      if (organizationId && !organizationRecord) {
-        Logger.log(`警告: 組織ID [${organizationId}] に対応する組織情報が見つかりませんでした。`);
-      }
+      if (organizationId && !organizationRecord) Logger.log(`警告: 組織ID [${organizationId}] に対応する組織情報が見つかりませんでした。`);
 
       const accountRecord = customerId ? await this._findRecordById('Account', customerId) : null;
-      if (customerId && !accountRecord) {
-        Logger.log(`警告: 取引先ID [${customerId}] に対応するアカウント情報が見つかりませんでした。`);
-      }
+      if (customerId && !accountRecord) Logger.log(`警告: 取引先ID [${customerId}] に対応するアカウント情報が見つかりませんでした。`);
 
       const historySummary = customerId ? await this._summarizePastActions(customerId, recordId) : '';
 
       const { processedAddPrompt, referenceContent, markdownLinkList } = this._processUrlInputs(addPrompt, referenceUrls);
+      
+      const companyInfoFromSearch = companyName ? await this._getCompanyInfo(companyName) : null;
       
       const placeholders = {
         '[顧客の会社名]': companyName,
@@ -157,17 +159,15 @@ class SalesCopilot {
         '[参考資料リンク]': markdownLinkList
       };
       
-      const companyInfoFromSearch = companyName ? await this._getCompanyInfo(companyName) : '';
-      
       const finalPrompt = this._buildFinalPrompt(mainPrompt || actionDetails.prompt, placeholders, contactMethod, probability, accountRecord, organizationRecord, companyInfoFromSearch, referenceContent, historySummary);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient(this.geminiModel);
       geminiClient.setSystemInstructionText(aiRoleDescription);
-      
       geminiClient.setPromptText(finalPrompt);
 
-      const response = await geminiClient.generateCandidates();
+      const response = await this._apiCallWithRetry(async () => await geminiClient.generateCandidates(), "メール本文生成");
+
       const generatedText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
       if (!generatedText) throw new Error('Geminiからの応答が空でした。');
 
@@ -181,9 +181,19 @@ class SalesCopilot {
         "link_markdown": markdownLinkList
       };
       
-      Logger.log(`更新ペイロード: ${JSON.stringify(updatePayload)}`);
-      await this._updateAppSheetRecord(recordId, updatePayload);
+      await this._updateAppSheetRecord('SalesAction', recordId, updatePayload);
       Logger.log(`処理完了 (AI提案生成): Record ID ${recordId}`);
+      
+      if (customerId && companyInfoFromSearch) {
+        Logger.log(`Accountテーブルの情報を最新化します (ID: ${customerId})`);
+        const accountUpdatePayload = {
+          id: customerId,
+          ...companyInfoFromSearch
+        };
+        console.log(accountUpdatePayload);
+        this._updateAppSheetRecord('Account', customerId, accountUpdatePayload)
+          .catch(e => Logger.log(`Accountテーブルの更新に失敗しました: ${e.message}`));
+      }
 
     } catch (e) {
       Logger.log(`❌ AI提案生成エラー: ${e.message}\n${e.stack}`);
@@ -199,18 +209,23 @@ class SalesCopilot {
       const completedAction = await this._findRecordById('SalesAction', completedActionId);
       if (!completedAction) throw new Error(`ID ${completedActionId} のアクションが見つかりません。`);
 
+      const accountId = completedAction.accountId; 
+      if(!accountId) {
+        Logger.log(`警告: 完了アクション[${completedActionId}]にアカウントIDが紐付いていません。`);
+        return;
+      }
+
       const nextActionFlow = this._getActionFlowDetails(completedAction['progress'], completedAction['action_name'], completedAction['result']);
       if (!nextActionFlow) {
-        await this._updateAppSheetRecord(completedActionId, {"next_action_description": "営業フロー完了"});
+        await this._updateAppSheetRecord('SalesAction', completedActionId, {"next_action_description": "営業フロー完了"});
         return;
       }
 
       const nextActionDetails = this._findNextActionInfo(nextActionFlow.next_action);
-      const updatePayload = {
+      await this._updateAppSheetRecord('SalesAction', completedActionId, {
         "next_action_category_id": nextActionDetails.id,
         "next_action_description": nextActionDetails.description
-      };
-      await this._updateAppSheetRecord(completedActionId, updatePayload);
+      });
     } catch (e) {
       Logger.log(`❌ 次アクション提案エラー: ${e.message}\n${e.stack}`);
       throw e;
@@ -221,13 +236,12 @@ class SalesCopilot {
    * 過去のアクション履歴を要約します。
    */
   async _summarizePastActions(customerId, currentActionId) {
-    try {
+    const task = async () => {
       Logger.log(`顧客ID [${customerId}] の過去の商談履歴の要約を開始します。`);
-      const selector = `FILTER("SalesAction", AND([取引先ID] = "${customerId}", [ID] <> "${currentActionId}"))`;
+      const selector = `FILTER("SalesAction", AND([accountId] = "${customerId}", [ID] <> "${currentActionId}"))`;
       const pastActions = await this.appSheetClient.findData('SalesAction', this.execUserEmail, { "Selector": selector });
 
       if (!pastActions || pastActions.length === 0) {
-        Logger.log("要約対象の過去のアクションはありませんでした。");
         return "";
       }
 
@@ -241,11 +255,11 @@ class SalesCopilot {
       const summarizerClient = new GeminiClient(this.geminiModel);
       summarizerClient.setPromptText(summarizationPrompt);
       const response = await summarizerClient.generateCandidates();
-      const summary = (response.candidates[0].content.parts || []).map(p => p.text).join('');
-      
-      Logger.log(`商談履歴の要約:\n${summary}`);
-      return summary;
+      return (response.candidates[0].content.parts || []).map(p => p.text).join('');
+    };
 
+    try {
+      return await this._apiCallWithRetry(task, "商談履歴の要約");
     } catch (e) {
       Logger.log(`商談履歴の要約中にエラーが発生しました: ${e.message}`);
       return "";
@@ -253,29 +267,54 @@ class SalesCopilot {
   }
   
   /**
-   * Google検索を使って企業情報を調査します。
+   * Google検索を使い、企業情報を構造化データとして取得します。
    */
   async _getCompanyInfo(companyName) {
-    try {
+     const task = async () => {
       const apiKey = PropertiesService.getScriptProperties().getProperty('GOOGLE_API_KEY');
       if (!apiKey || apiKey === 'YOUR_API_KEY_HERE') {
         Logger.log('⚠️ 企業情報のリアルタイム検索はスキップされました。スクリプトプロパティに「GOOGLE_API_KEY」が設定されていません。');
-        return '(リアルタイム企業情報の検索に失敗しました)';
+        return null;
       }
+      
+      const researchPrompt = `
+        以下の企業について、公開情報を調査し、指定されたJSON形式で回答してください。
+        会社名: ${companyName}
+        
+        # 収集項目
+        - 事業内容 (company_description)
+        - 主な製品やサービス (main_service)
+        - 最新のニュースやプレスリリース (last_signal_summary)
+        
+        # 出力形式 (JSON)
+        見つからない情報は "不明" としてください。
+        {
+          "company_description": "...",
+          "main_service": "...",
+          "last_signal_summary": "..."
+        }
+      `;
 
-      const researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
       const researchClient = new GeminiClient(this.geminiModel);
-      
       researchClient.enableGoogleSearchTool(); 
-      
       researchClient.setPromptText(researchPrompt);
+      
       const response = await researchClient.generateCandidates();
-      const info = (response.candidates[0].content.parts || []).map(p => p.text).join('');
-      Logger.log(`企業情報の調査結果:\n${info}`);
-      return info;
+      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      
+      Logger.log(`企業情報の調査結果(生データ):\n${responseText}`);
+      const jsonMatch = responseText.match(/{[\s\S]*}/);
+      if (!jsonMatch) {
+          throw new Error("AIの応答から有効なJSONを抽出できませんでした。");
+      }
+      return JSON.parse(jsonMatch[0]);
+    };
+
+    try {
+      return await this._apiCallWithRetry(task, "企業情報検索");
     } catch (e) {
       Logger.log(`企業情報の調査中にエラーが発生しました: ${e.message}`);
-      return '(リアルタイム企業情報の検索中にエラーが発生しました)';
+      return null;
     }
   }
 
@@ -300,14 +339,9 @@ class SalesCopilot {
         break;
     }
 
-    let filledTemplate = template;
-    for (const key in placeholders) {
-      if (placeholders[key] !== undefined && placeholders[key] !== null) {
-        const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(escapedKey, 'g');
-        filledTemplate = filledTemplate.replace(regex, placeholders[key]);
-      }
-    }
+    let filledTemplate = template.replace(/\[[^\]]+\]/g, (match) => {
+        return (placeholders[match] !== undefined && placeholders[match] !== null) ? placeholders[match] : match;
+    });
     
     if (!placeholders['[イベント名]']) {
       filledTemplate = filledTemplate.replace(/\[イベント名\]では（イベント名が空白の場合はここは削除）、/g, '');
@@ -328,11 +362,17 @@ class SalesCopilot {
     }
 
     if (accountRecord) {
-      additionalInfo += `--- 企業情報（システムより取得） ---\n`;
-      if (accountRecord.company_description) additionalInfo += `- 事業内容: ${accountRecord.company_description}\n`;
-      if (accountRecord.main_service) additionalInfo += `- 主な製品/サービス: ${accountRecord.main_service}\n`;
-      if (accountRecord.last_signal_summary) additionalInfo += `- 最新の動向: ${accountRecord.last_signal_summary}\n`;
-      if (accountRecord.website_url) additionalInfo += `- ウェブサイト: ${accountRecord.website_url}\n`;
+      additionalInfo += `--- 企業情報（DBより取得） ---\n`;
+      additionalInfo += `- 事業内容: ${accountRecord.company_description || '未登録'}\n`;
+      additionalInfo += `- 最新の動向: ${accountRecord.last_signal_summary || '未登録'}\n`;
+      hasInfo = true;
+    }
+    
+    if (companyInfoFromSearch) {
+      additionalInfo += `\n--- 企業調査情報（リアルタイム検索） ---\n`;
+      additionalInfo += `- 事業内容: ${companyInfoFromSearch.company_description || '不明'}\n`;
+      additionalInfo += `- 主な製品/サービス: ${companyInfoFromSearch.main_service || '不明'}\n`;
+      additionalInfo += `- 最新のニュース: ${companyInfoFromSearch.last_signal_summary || '不明'}\n`;
       hasInfo = true;
     }
     
@@ -347,12 +387,7 @@ class SalesCopilot {
       hasInfo = true;
     }
 
-    if (companyInfoFromSearch) {
-      additionalInfo += `\n--- 企業調査情報（Google検索） ---\n${companyInfoFromSearch}\n`;
-      hasInfo = true;
-    }
     if (referenceContent) {
-      // ★★★ 修正点: 「引継ぎ資料」であることを明記 ★★★
       additionalInfo += `\n--- 参考資料・引継ぎ資料の内容 ---\n${referenceContent}\n`;
       hasInfo = true;
     }
@@ -369,9 +404,8 @@ class SalesCopilot {
     if (contactMethod === 'メール') {
       finalInstruction = `\n\n【重要】\n- 以下の【メール本文の骨子】と【補足情報】を基に、完成されたメール文章を、【件名】と【本文】の形式で生成してください。`;
       finalInstruction += `\n- 全体のトーンは、補足情報にある「現在の契約確度: ${currentProbability}」を考慮し、「${toneInstruction}」という指示に従ってください。`;
+      finalInstruction += `\n- **【最優先事項】「企業調査情報（リアルタイム検索）」の結果を最優先で参考にして、具体的でタイムリーな内容を盛り込んでください。DBの情報と異なる場合は、必ずリアルタイム検索の結果を使用してください。**`;
       finalInstruction += `\n- 本文は、読みやすさを向上させるため、必要に応じて太字（**テキスト**）や箇条書き（- テキスト）などのMarkdown形式で記述してください。`;
-      // ★★★ 修正点: 引継ぎ資料の活用を指示 ★★★
-      finalInstruction += `\n- 【補足情報】にある「企業情報」「商談履歴の要約」「自社情報」「参考資料・引継ぎ資料の内容」を最優先で参考にし、本文の冒頭で相手が「おっ」と思うような、関心を持っていることが伝わる自然な一文を加えてください。`;
       finalInstruction += `\n- **テンプレート内のプレースホルダーは、補足情報を使って必ず具体的な内容に置き換えてください。** 最終的な文章に[]が残らないようにしてください。`;
       finalInstruction += `\n- 「利用可能な参考資料リンク」セクションに記載されているMarkdownリンクは、すべて本文中に自然な形で含めてください。`;
       finalInstruction += `\n- ★提供された情報以外のURL（例: https://example.com）は、絶対に生成しないでください。★`;
@@ -387,16 +421,19 @@ class SalesCopilot {
   /**
    * レコードを更新します。
    */
-  async _updateAppSheetRecord(recordId, fieldsToUpdate) {
-    const recordData = { "ID": recordId, ...fieldsToUpdate };
-    return await this.appSheetClient.updateRecords('SalesAction', [recordData], this.execUserEmail);
+  async _updateAppSheetRecord(tableName, recordId, fieldsToUpdate) {
+    const recordData = (tableName === 'Account') 
+      ? { id: recordId, ...fieldsToUpdate }
+      : { ID: recordId, ...fieldsToUpdate };
+    return await this.appSheetClient.updateRecords(tableName, [recordData], this.execUserEmail);
   }
 
   /**
    * レコードをIDで検索します。
    */
   async _findRecordById(tableName, recordId) {
-    const selector = `FILTER("${tableName}", [ID] = "${recordId}")`;
+    const keyColumn = (tableName === 'Account' || tableName === 'Organization') ? 'id' : 'ID';
+    const selector = `FILTER("${tableName}", [${keyColumn}] = "${recordId}")`;
     const properties = { "Selector": selector };
     const result = await this.appSheetClient.findData(tableName, this.execUserEmail, properties);
     if (result && Array.isArray(result) && result.length > 0) {
@@ -404,6 +441,28 @@ class SalesCopilot {
     }
     Logger.log(`テーブル[${tableName}]からID[${recordId}]のレコードが見つかりませんでした。応答: ${JSON.stringify(result)}`);
     return null;
+  }
+
+  /**
+   * API呼び出しを指定回数リトライするヘルパー関数。
+   */
+  async _apiCallWithRetry(apiCallFunction, taskName = 'API呼び出し') {
+    let lastError;
+    for (let i = 0; i < RETRY_CONFIG.count; i++) {
+      try {
+        return await apiCallFunction();
+      } catch (e) {
+        lastError = e;
+        if (e.message && e.message.includes('status 50')) {
+          const delay = RETRY_CONFIG.delay * Math.pow(2, i);
+          Logger.log(`🔁 ${taskName}で一時的なエラーが発生しました (試行 ${i + 1}/${RETRY_CONFIG.count})。${delay}ms後に再試行します。エラー: ${e.message}`);
+          Utilities.sleep(delay);
+        } else {
+          throw lastError;
+        }
+      }
+    }
+    throw lastError;
   }
 
   // 他のヘルパー関数は変更ないため、元の実装を維持します。
