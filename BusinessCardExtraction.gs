@@ -1,15 +1,14 @@
 /**
- * @fileoverview AppSheetからトリガーされる名刺情報抽出・更新バックエンド (ドメイン判定によるアカウント連携強化版)
- * @version 3.0.0
+ * @fileoverview AppSheetからトリガーされる名刺情報抽出・更新バックエンド (バッチ処理対応版)
+ * @version 5.0.0
  * @description
- * 会社名での重複を防ぐため、メールアドレスのドメインを最優先で照合してアカウントを特定するロジックを実装。
- * 存在しない場合は会社名でフォールバックし、それでも見つからなければドメイン情報と共に新規アカウントを作成します。
+ * 名刺情報抽出と、ドメイン/会社名によるアカウント連携に特化したスクリプト。
+ * 時間のかかる企業情報の自動収集機能は分離し、バッチ処理に移行。
  *
- * 【v3.0.0での主な変更点】
- * - アカウントを特定するロジックを「ドメイン優先、会社名がサブ」に変更。
- * - Accountテーブルに`domain`列が追加されていることを前提とした実装。
- * - `_findOrCreateAccount`をドメイン検索に対応するよう大幅に修正。
- * - フリーメールのドメインを無視するヘルパー関数`_extractDomainFromEmail`を追加。
+ * 【v5.0.0での主な変更点】
+ * - パフォーマンス向上のため、アカウント新規作成時のAIによる企業情報収集処理を削除。
+ * - 代わりに、新規作成されたアカウントに `enrichment_status` = 'Pending' を設定し、
+ * 別のバッチ処理スクリプトが後から情報を補完できるようにした。
  */
 
 // =================================================================
@@ -44,7 +43,6 @@ const GEMINI_MODEL_NAME = 'gemini-1.5-flash-latest';
 // --- APIキー関連 (スクリプトプロパティでの設定を強く推奨します) ---
 const APPSHEET_API_KEY = PropertiesService.getScriptProperties().getProperty('APPSHEET_API_KEY') || 'YOUR_APPSHEET_APIKEY';
 const CLOUDCONVERT_API_KEY = PropertiesService.getScriptProperties().getProperty('CLOUDCONVERT_API_KEY') || 'YOUR_CLOUDCONVERT_APIKEY';
-// Gemini APIキーは 'GOOGLE_API_KEY' という名前でスクリプトプロパティに設定してください。
 
 
 // --- Gemini プロンプト定義 (英語) ---
@@ -186,7 +184,7 @@ async function processBusinessCard(tableName, fileIds, recordId, execUser) {
   geminiClient.setSystemInstructionText(PROMPT_SYSTEM_INSTRUCTION);
   processedImageFiles.forEach(file => geminiClient.attachFiles(file.getBlob()));
   geminiClient.setPromptText(fullUserPrompt);
-  const geminiResponse = geminiClient.generateCandidates();
+  const geminiResponse = await geminiClient.generateCandidates();
   if (!geminiResponse.candidates || geminiResponse.candidates.length === 0) {
     throw new Error(`Geminiからの応答がありませんでした。レスポンス: ${JSON.stringify(geminiResponse)}`);
   }
@@ -243,7 +241,7 @@ async function processBusinessCard(tableName, fileIds, recordId, execUser) {
 // =================================================================
 
 /**
- * 会社名またはメールドメインを基にAccountテーブルを検索し、存在しない場合は新規作成する。
+ * 会社名またはメールドメインを基にAccountテーブルを検索し、存在しない場合は基本的な情報で新規作成する。
  * @param {AppSheetClient} client - AppSheetClientのインスタンス。
  * @param {Object} cardData - 名刺から抽出したデータ。
  * @param {string} userEmail - 実行ユーザーのメールアドレス。
@@ -284,11 +282,12 @@ async function _findOrCreateAccount(client, cardData, userEmail) {
       }
     }
 
-    // 3. 新規アカウントを作成
+    // 3. 新規アカウントを作成 (企業情報収集は行わない)
     console.log(`新規アカウントを作成します: ${companyName || domain}`);
+    
     const newAccountPayload = {
       name: companyName,
-      domain: domain, // ★★★ ドメインも保存 ★★★
+      domain: domain, 
       postal_code: cardData.postalCode,
       address: cardData.address,
       building_name: cardData.buildingName,
@@ -296,11 +295,13 @@ async function _findOrCreateAccount(client, cardData, userEmail) {
       phone_number: cardData.phoneNumber,
       fax_number: cardData.faxNumber,
       note: cardData.otherNotes,
+      corporate_number: cardData.corporateNumber,
+      website_url: cardData.link1,
+      enrichment_status: 'Pending' // ★★★ バッチ処理の対象とするためのステータス ★★★
     };
     
     const addResponse = await client.addRecords("Account", [newAccountPayload], userEmail);
     
-    // 応答から新しいレコードIDを取得する (成功した場合)
     if (addResponse && addResponse.Rows && addResponse.Rows.length > 0 && addResponse.Rows[0].id) {
         const newAccountId = addResponse.Rows[0].id;
         console.log(`新規アカウントを作成しました: ${newAccountId}`);

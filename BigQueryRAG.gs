@@ -1,15 +1,15 @@
 /**
  * =================================================================
- * 成功事例ナレッジベース自動更新スクリプト (RAG - Part 1) v2
+ * 成功事例ナレッジベース自動更新スクリプト (RAG - Part 1) v9
  * =================================================================
  * このスクリプトは、1日1回、夜間などに定時実行トリガーで呼び出されることを想定しています。
  * 過去の成功したSalesActionを抽出し、AIによる要約とベクトル化を行い、
  * BigQuery上のナレッジベースに蓄積します。
  *
- * 【v2での主な変更点】
- * - ユーザーから提供されたBigQueryのスキーマに合わせて、保存するデータの構造を変更しました。
- * - SalesActionに加え、関連するBusinessCard（顧客情報）も参照し、
- * `company_size`や`industry`といった属性情報もナレッジに含めるようにしました。
+ * 【v9での主な変更点】
+ * - 企業規模や業種などの顧客情報を、BusinessCardテーブルではなく、
+ * その親であるAccountテーブルから取得するようにロジックを修正しました。
+ * これにより、より正確で一元化された情報がナレッジに反映されます。
  * =================================================================
  */
 
@@ -25,19 +25,112 @@ const BqTableId = 'knowledge_base'; // ナレッジベースのテーブルID
  * この関数を毎日深夜などに実行するよう、Apps Scriptのトリガーを設定してください。
  */
 function runDailyKnowledgeBaseUpdate() {
-  try {
-    // 実行ユーザーはスクリプトの所有者や固定の管理者を指定するのが一般的です
-    const execUserEmail = 'admin@your-company.com';
-    Logger.log('ナレッジベースの更新処理を開始します...');
-    
-    const manager = new KnowledgeBaseManager(execUserEmail);
-    manager.updateKnowledgeBase();
-    
-    Logger.log('ナレッジベースの更新処理が正常に完了しました。');
-  } catch (e) {
-    Logger.log(`ナレッジベースの更新中に致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
-  }
+  // async/awaitをトップレベルで安全に扱うため、無名関数でラップして実行します。
+  (async () => {
+    try {
+      const execUserEmail = PropertiesService.getScriptProperties().getProperty('SERVICE_ACCOUNT');
+      if (!execUserEmail) {
+        throw new Error("スクリプトプロパティ 'SERVICE_ACCOUNT' が設定されていません。");
+      }
+      
+      Logger.log(`ナレッジベースの更新処理を開始します... (実行アカウント: ${execUserEmail})`);
+      
+      const manager = new KnowledgeBaseManager(execUserEmail);
+      await manager.updateKnowledgeBase();
+      
+      Logger.log('ナレッジベースの更新処理が正常に完了しました。');
+    } catch (e) {
+      Logger.log(`ナレッジベースの更新中に致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
+    }
+  })().catch(e => Logger.log(`❌ 非同期処理の実行中にエラー: ${e.message}`));
 }
+
+/**
+ * 【開発・テスト用】KnowledgeBaseManagerの処理を直接実行します。
+ */
+function test_KnowledgeBaseManager() {
+    (async () => {
+    try {
+      const execUserEmail = PropertiesService.getScriptProperties().getProperty('SERVICE_ACCOUNT');
+      if (!execUserEmail) {
+        throw new Error("スクリプトプロパティ 'SERVICE_ACCOUNT' が設定されていません。");
+      }
+      
+      Logger.log(`テスト実行を開始します... (実行アカウント: ${execUserEmail})`);
+      
+      const manager = new KnowledgeBaseManager(execUserEmail);
+      await manager.updateKnowledgeBase();
+      
+      Logger.log('テスト実行が完了しました。');
+    } catch (e) {
+      Logger.log(`テスト実行中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    }
+  })().catch(e => Logger.log(`❌ 非同期処理の実行中にエラー: ${e.message}`));
+}
+
+/**
+ * 【開発・テスト用】動作確認のためのダミーデータをAppSheetに登録します。
+ */
+function addDummyDataForTesting() {
+  (async () => {
+    try {
+      const execUserEmail = Session.getActiveUser().getEmail() || PropertiesService.getScriptProperties().getProperty('SERVICE_ACCOUNT');
+      Logger.log(`ダミーデータの登録を開始します... (実行アカウント: ${execUserEmail})`);
+
+      const client = new AppSheetClient(
+        PropertiesService.getScriptProperties().getProperty('APPSHEET_APP_ID'),
+        PropertiesService.getScriptProperties().getProperty('APPSHEET_API_KEY')
+      );
+      
+      // 1. ダミーのAccountデータを作成
+      const newAccountId = Utilities.getUuid();
+      const dummyAccount = {
+        id: newAccountId,
+        name: "株式会社ダミーインダストリー",
+        industry: "製造業",
+        company_size: "501-1000名",
+        domain: "dummy-industry.example.com"
+      };
+      await client.addRecords("Account", [dummyAccount], execUserEmail);
+      Logger.log(`ダミーのAccountを作成しました: ${dummyAccount.name} (ID: ${newAccountId})`);
+
+      // 2. ダミーの顧客データを作成
+      const newBusinessCardId = Utilities.getUuid();
+      const dummyCustomer = {
+        id: newBusinessCardId,
+        account_id: newAccountId, // 作成したAccountに紐付ける
+        companyName: dummyAccount.name,
+        name: "ダミー 次郎",
+        department: "生産管理部",
+        position: "課長",
+        email: `jiro.dummy@${dummyAccount.domain}`,
+        enabled_contact: true
+      };
+      await client.addRecords("BusinessCard", [dummyCustomer], execUserEmail);
+      Logger.log(`ダミーの顧客を作成しました: ${dummyCustomer.name} (ID: ${newBusinessCardId})`);
+      
+      // 3. 上記顧客に対する「成功事例」となるアクションを作成
+      const dummySalesAction = {
+        id: Utilities.getUuid(),
+        business_card_id: newBusinessCardId,
+        progress: "提案済/検討中",
+        action_name: "提案後フォローアップ",
+        contactMethod: "メール",
+        result: "受注",
+        excuted_dt: new Date().toISOString(),
+        addPrompt: "最終提案後、AIが生成したフォローアップメールを送信したところ、翌日に受注の連絡があった。特に、顧客の過去の発言を踏まえたパーソナライズが効果的だった模様。"
+      };
+      await client.addRecords("SalesAction", [dummySalesAction], execUserEmail);
+      Logger.log(`ダミーの成功事例を作成しました: ${dummySalesAction.action_name} -> ${dummySalesAction.result}`);
+      
+      Logger.log("ダミーデータの登録が完了しました。");
+
+    } catch (e) {
+      Logger.log(`ダミーデータの登録中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    }
+  })().catch(e => Logger.log(`❌ 非同期処理の実行中にエラー: ${e.message}`));
+}
+
 
 /**
  * @class KnowledgeBaseManager
@@ -52,15 +145,15 @@ class KnowledgeBaseManager {
     this.execUserEmail = execUserEmail;
     this.appSheetClient = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
     this.embeddingClient = new EmbeddingClient('text-embedding-004'); // ベクトル化に使用するモデル
-    this.customerDataCache = {}; // 顧客データのキャッシュ
+    this.accountDataCache = {}; // Accountデータのキャッシュ
   }
 
   /**
    * ナレッジベースの更新プロセス全体を実行します。
    */
-  updateKnowledgeBase() {
+  async updateKnowledgeBase() {
     // 1. AppSheetから成功事例を抽出
-    const successfulActions = this._extractSuccessfulActions();
+    const successfulActions = await this._extractSuccessfulActions();
     if (!successfulActions || successfulActions.length === 0) {
       Logger.log("更新対象の新しい成功事例はありませんでした。");
       return;
@@ -68,84 +161,148 @@ class KnowledgeBaseManager {
     Logger.log(`${successfulActions.length}件の成功事例を抽出しました。`);
 
     // 2. 各事例を要約し、ベクトル化
-    const knowledgeEntries = successfulActions.map(action => {
-      const customerInfo = this._getCustomerInfo(action.business_card_id);
-      if (!customerInfo) {
-        Logger.log(`アクション[${action.id}]の顧客情報が見つからないためスキップします。`);
+    const knowledgeEntries = await Promise.all(successfulActions.map(async (action) => {
+      const businessCard = await this._getBusinessCardInfo(action.business_card_id);
+      if (!businessCard || !businessCard.account_id) {
+        Logger.log(`アクション[${action.id}]の顧客情報またはアカウント情報が見つからないためスキップします。`);
         return null;
       }
       
-      const summary = this._summarizeAction(action, customerInfo);
+      let accountInfo = await this._getAccountInfo(businessCard.account_id);
+      if (!accountInfo) {
+        Logger.log(`アカウント[${businessCard.account_id}]の情報が見つからないためスキップします。`);
+        return null;
+      }
+      
+      // 業種や企業規模が不明な場合に情報を補完
+      if (accountInfo.name && (!accountInfo.industry || !accountInfo.company_size)) {
+        const enrichedInfo = this._enrichCustomerInfo(accountInfo.name);
+        accountInfo.industry = accountInfo.industry || enrichedInfo.industry;
+        accountInfo.company_size = accountInfo.company_size || enrichedInfo.company_size;
+      }
+      
+      const summary = this._summarizeAction(action, businessCard, accountInfo);
       if (!summary) return null;
 
       const embedding = this.embeddingClient.generate(summary, 'RETRIEVAL_DOCUMENT');
       
       return {
         chunk_id: action.id, 
-        organization_id: customerInfo.organization_id || '', // 組織ID
-        account_id: action.business_card_id,
+        organization_id: accountInfo.organization_id || '', 
+        account_id: businessCard.account_id,
         source_document: action.id,
         chunk_text: summary,
         embedding: embedding,
-        company_size: customerInfo.company_size || '',
-        industry: customerInfo.industry || '',
+        company_size: accountInfo.company_size || '',
+        industry: accountInfo.industry || '',
         deal_type: action.action_name || ''
       };
-    }).filter(entry => entry); // nullになったものを除去
+    }));
+    
+    const validEntries = knowledgeEntries.filter(entry => entry); // nullになったものを除去
 
     // 3. BigQueryに保存
-    if (knowledgeEntries.length > 0) {
-      this._upsertToBigQuery(knowledgeEntries);
+    if (validEntries.length > 0) {
+      this._upsertToBigQuery(validEntries);
     }
   }
 
   /**
    * AppSheetから成功したSalesActionレコードを抽出します。
    * @private
-   * @returns {Object[]} 成功したアクションのレコード配列
+   * @returns {Promise<Object[]>} 成功したアクションのレコード配列
    */
-  _extractSuccessfulActions() {
+  async _extractSuccessfulActions() {
     // 「受注」または「アポイント取得」したアクションを成功と定義
     const successConditions = ['受注', 'アポイント取得'];
     // 過去7日間の成功事例のみを対象にする例（期間は調整可能）
-    const selector = `FILTER("SalesAction", AND(IN([result], ${JSON.stringify(successConditions)}), ([実施日時] > (NOW() - "168:00:00"))))`;
+    const selector = `FILTER("SalesAction", AND(IN([result], ${JSON.stringify(successConditions)}), ([excuted_dt] > (NOW() - "168:00:00"))))`;
 
-    const results = this.appSheetClient.findData('SalesAction', this.execUserEmail, { "Selector": selector });
+    const results = await this.appSheetClient.findData('SalesAction', this.execUserEmail, { "Selector": selector });
     return results || [];
   }
   
   /**
-   * AppSheetから顧客情報を取得します（キャッシュ付き）
+   * AppSheetから名刺（個人）情報を取得します。
    * @private
-   * @param {string} customerId - 顧客ID
-   * @returns {Object|null} - 顧客情報のレコード
+   * @param {string} businessCardId - 名刺ID
+   * @returns {Promise<Object|null>} - 名刺情報のレコード
    */
-  _getCustomerInfo(customerId) {
-    if (this.customerDataCache[customerId]) {
-        return this.customerDataCache[customerId];
+  async _getBusinessCardInfo(businessCardId) {
+    if (!businessCardId) return null;
+    const selector = `FILTER("BusinessCard", [id] = "${businessCardId}")`;
+    const result = await this.appSheetClient.findData('BusinessCard', this.execUserEmail, { "Selector": selector });
+    return (result && result.length > 0) ? result[0] : null;
+  }
+
+  /**
+   * AppSheetからアカウント（企業）情報を取得します（キャッシュ付き）
+   * @private
+   * @param {string} accountId - アカウントID
+   * @returns {Promise<Object|null>} - アカウント情報のレコード
+   */
+  async _getAccountInfo(accountId) {
+    if (!accountId) return null;
+    if (this.accountDataCache[accountId]) {
+        return this.accountDataCache[accountId];
     }
-    const selector = `FILTER("BusinessCard", [id] = "${customerId}")`;
-    const result = this.appSheetClient.findData('BusinessCard', this.execUserEmail, { "Selector": selector });
+    const selector = `FILTER("Account", [id] = "${accountId}")`;
+    const result = await this.appSheetClient.findData('Account', this.execUserEmail, { "Selector": selector });
     if (result && result.length > 0) {
-        this.customerDataCache[customerId] = result[0];
+        this.accountDataCache[accountId] = result[0];
         return result[0];
     }
     return null;
   }
 
   /**
+   * Google検索を使い、企業の業種と規模情報を補完します。
+   * @private
+   * @param {string} companyName - 調査対象の企業名
+   * @returns {{industry: string, company_size: string}} - 調査結果
+   */
+  _enrichCustomerInfo(companyName) {
+    if (!companyName) return { industry: '', company_size: '' };
+    
+    try {
+      Logger.log(`企業情報の補完を開始: ${companyName}`);
+      const prompt = `日本の企業「${companyName}」について、公開情報から「業種」と「従業員数に基づいた企業規模」を調べてください。企業規模は以下の選択肢から最も適切なものを選んでください: [1-10名, 11-50名, 51-100名, 101-500名, 501-1000名, 1001名以上]。以下のJSON形式だけで回答してください:\n{"industry": "（業種）", "company_size": "（企業規模の選択肢）"}`;
+      
+      const client = new GeminiClient('gemini-1.5-flash-latest');
+      client.enableGoogleSearchTool();
+      client.setPromptText(prompt);
+      
+      const response = client.generateCandidates();
+      const textResponse = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      const cleanedJsonString = textResponse.replace(/^```json\s*|```\s*$/g, '').trim();
+      const enrichedData = JSON.parse(cleanedJsonString);
+
+      Logger.log(`補完結果: ${JSON.stringify(enrichedData)}`);
+      return {
+        industry: enrichedData.industry || '',
+        company_size: enrichedData.company_size || ''
+      };
+
+    } catch (e) {
+      Logger.log(`企業情報の補完中にエラーが発生しました (${companyName}): ${e.message}`);
+      return { industry: '', company_size: '' };
+    }
+  }
+
+  /**
    * 個々のアクションの内容をAIに要約させます。
    * @private
    * @param {Object} action - 要約対象のSalesActionレコード
-   * @param {Object} customerInfo - 顧客情報のレコード
+   * @param {Object} businessCard - 名刺情報のレコード
+   * @param {Object} accountInfo - アカウント情報のレコード
    * @returns {string|null} - AIが生成した要約テキスト
    */
-  _summarizeAction(action, customerInfo) {
+  _summarizeAction(action, businessCard, accountInfo) {
     try {
       const context = `
-        - 顧客名: ${customerInfo.companyName || '不明'}
-        - 業種: ${customerInfo.industry || '不明'}
-        - 企業規模: ${customerInfo.company_size || '不明'}
+        - 顧客名: ${accountInfo.name || '不明'} (${businessCard.name || '担当者不明'})
+        - 業種: ${accountInfo.industry || '不明'}
+        - 企業規模: ${accountInfo.company_size || '不明'}
         - 実施したアクション: ${action.action_name} (${action.contactMethod})
         - 提案内容の要点: ${action.addPrompt || '記載なし'}
         - 最終的な結果: ${action.result}
