@@ -1,27 +1,38 @@
 /**
  * =================================================================
- * AI Sales Action (リファクタリング版 v19)
+ * AI Sales Action (v20.0 - モデル更新版)
  * =================================================================
- * v18をベースに、企業調査の精度向上とソース表示機能を追加しました。
+ * AI提案の品質をさらに向上させるため、使用するGeminiモデルを
+ * 最新の`gemini-2.5-flash-preview-05-20`に更新しました。
  *
- * 【v19での主な変更点】
- * - 企業調査時に住所やURLを付加情報として利用し、調査対象の特定精度を向上。
- * - 調査対象が曖昧な場合にAIが警告を出すよう、プロンプトを改善。
- * - リアルタイム調査の参照元URLを、クリック可能なリンクリストとして表示する機能を追加。
+ * 【v20.0での主な変更点】
+ * - メール文面や企業調査の要約に使用するAIモデルを、より高性能な
+ * `gemini-2.5-flash-preview-05-20`にアップグレード。
+ * - モデル名をスクリプトプロパティで管理できるようにし、保守性を向上。
  * =================================================================
  */
 
 // =================================================================
 // 定数宣言
 // =================================================================
-const MASTER_SHEET_NAMES = {
-  actionCategories: 'ActionCategory',
-  aiRoles: 'AIRole',
-  salesFlows: 'ActionFlow'
-};
-const RETRY_CONFIG = {
-  count: 3, // 最大リトライ回数
-  delay: 2000 // 初回のリトライ待機時間（ミリ秒）
+const AISALESACTION_CONSTANTS = {
+  MASTER_SHEET_NAMES: {
+    actionCategories: 'ActionCategory',
+    aiRoles: 'AIRole',
+    salesFlows: 'ActionFlow'
+  },
+  RETRY_CONFIG: {
+    count: 3, // 最大リトライ回数
+    delay: 2000 // 初回のリトライ待機時間（ミリ秒）
+  },
+  PROPS_KEY: {
+    GEMINI_MODEL: 'AISALESACTION_MODEL', // SalesAction用モデルのプロパティキー
+    APPSHEET_APP_ID: 'APPSHEET_APP_ID',
+    APPSHEET_API_KEY: 'APPSHEET_API_KEY',
+    MASTER_SHEET_ID: 'MASTER_SHEET_ID',
+    GOOGLE_API_KEY: 'GOOGLE_API_KEY',
+  },
+  DEFAULT_MODEL: 'gemini-2.5-flash-preview-05-20', // 高品質な文章生成に推奨されるモデル
 };
 
 
@@ -46,7 +57,7 @@ function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, a
     Logger.log(`❌ ${errorMessage}`);
     try {
       const props = PropertiesService.getScriptProperties().getProperties();
-      const client = new AppSheetClient(props.APPSHEET_APP_ID, props.APPSHEET_API_KEY);
+      const client = new AppSheetClient(props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID], props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY]);
       const errorPayload = {
         "ID": recordId,
         "execute_ai_status": "エラー",
@@ -101,16 +112,18 @@ class SalesCopilot {
 
     this.props = PropertiesService.getScriptProperties().getProperties();
     this.execUserEmail = execUserEmail;
-    this.appSheetClient = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
+    this.appSheetClient = new AppSheetClient(this.props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID], this.props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY]);
     
-    this.geminiModel = 'gemini-2.0-flash'; 
+    // ★ v20.0 修正点: 使用モデルを定数とスクリプトプロパティで管理
+    this.geminiModel = this.props[AISALESACTION_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || AISALESACTION_CONSTANTS.DEFAULT_MODEL;
+    Logger.log(`[INFO] SalesCopilot initialized with model: ${this.geminiModel}`);
 
-    const masterSheetId = this.props.MASTER_SHEET_ID;
+    const masterSheetId = this.props[AISALESACTION_CONSTANTS.PROPS_KEY.MASTER_SHEET_ID];
     if (!masterSheetId) throw new Error("マスターシートのIDがスクリプトプロパティに設定されていません。");
 
-    this.actionCategories = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.actionCategories);
-    this.aiRoles = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.aiRoles);
-    this.salesFlows = this._loadSheetData(masterSheetId, MASTER_SHEET_NAMES.salesFlows);
+    this.actionCategories = this._loadSheetData(masterSheetId, AISALESACTION_CONSTANTS.MASTER_SHEET_NAMES.actionCategories);
+    this.aiRoles = this._loadSheetData(masterSheetId, AISALESACTION_CONSTANTS.MASTER_SHEET_NAMES.aiRoles);
+    this.salesFlows = this._loadSheetData(masterSheetId, AISALESACTION_CONSTANTS.MASTER_SHEET_NAMES.salesFlows);
   }
 
   /**
@@ -137,19 +150,29 @@ class SalesCopilot {
       const accountRecord = customerId ? await this._findRecordById('Account', customerId) : null;
       if (customerId && !accountRecord) Logger.log(`警告: 取引先ID [${customerId}] に対応するアカウント情報が見つかりませんでした。`);
 
+      const effectiveCompanyName = accountRecord ? accountRecord.name : companyName;
+      if (!effectiveCompanyName) {
+        Logger.log(`警告: 処理対象の会社名を特定できませんでした。 (accountId: ${accountId})。引数で渡されたcompanyNameも空です。`);
+      }
+      
+      const effectiveAddress = accountRecord?.address || companyAddress;
+      const effectiveWebsiteUrl = accountRecord?.website_url;
+
       const historySummary = customerId ? await this._summarizePastActions(customerId, recordId) : '';
 
       const { processedAddPrompt, referenceContent, markdownLinkList } = this._processUrlInputs(addPrompt, referenceUrls);
       
-      const companyInfoResult = companyName ? await this._getCompanyInfo(companyName, companyAddress, accountRecord?.website_url) : null;
-      const companyInfoFromSearch = companyInfoResult ? companyInfoResult.summary : '';
-      const searchSourcesMarkdown = companyInfoResult ? companyInfoResult.sourcesMarkdown : '';
+      const companyInfoResult = effectiveCompanyName ? await this._getCompanyInfo(effectiveCompanyName, effectiveAddress, effectiveWebsiteUrl) : null;
       
+      const companyInfoForPrompt = companyInfoResult ? this._formatCompanyInfoForPrompt(companyInfoResult.structuredData) : '';
+      const updatePayloadForAccount = companyInfoResult ? companyInfoResult.structuredData : null;
+      const searchSourcesMarkdown = companyInfoResult ? companyInfoResult.sourcesMarkdown : '';
+
       const placeholders = {
-        '[顧客の会社名]': companyName,
-        '[取引先会社名]': companyName,
-        '[企業名]': companyName,
-        '[会社の住所]': companyAddress,
+        '[顧客の会社名]': effectiveCompanyName,
+        '[取引先会社名]': effectiveCompanyName,
+        '[企業名]': effectiveCompanyName,
+        '[会社の住所]': effectiveAddress,
         '[取引先担当者名]': customerContactName,
         '[取引先氏名]': customerContactName,
         '[自社担当者名]': ourContactName,
@@ -160,7 +183,7 @@ class SalesCopilot {
         '[参考資料リンク]': markdownLinkList
       };
       
-      const finalPrompt = this._buildFinalPrompt(mainPrompt || actionDetails.prompt, placeholders, contactMethod, probability, accountRecord, organizationRecord, companyInfoFromSearch, referenceContent, historySummary);
+      const finalPrompt = this._buildFinalPrompt(mainPrompt || actionDetails.prompt, placeholders, contactMethod, probability, accountRecord, organizationRecord, companyInfoForPrompt, referenceContent, historySummary);
       Logger.log(`最終プロンプト: \n${finalPrompt}`);
 
       const geminiClient = new GeminiClient(this.geminiModel);
@@ -174,16 +197,22 @@ class SalesCopilot {
 
       const formattedData = this._formatResponse(generatedText, contactMethod);
       
-      const updatePayload = {
-        "suggest_ai_text": formattedData.suggest_ai_text + searchSourcesMarkdown, // ソース情報を追記
+      const updatePayloadForSalesAction = {
+        "suggest_ai_text": formattedData.suggest_ai_text + searchSourcesMarkdown,
         "subject": formattedData.subject,
         "body": formattedData.body,
         "execute_ai_status": "提案済み",
         "link_markdown": markdownLinkList
       };
       
-      await this._updateAppSheetRecord('SalesAction', recordId, updatePayload);
-      Logger.log(`処理完了 (AI提案生成): Record ID ${recordId}`);
+      await this._updateAppSheetRecord('SalesAction', recordId, updatePayloadForSalesAction);
+      Logger.log(`処理完了 (AI提案生成): SalesAction ID ${recordId} を更新しました。`);
+      
+      if (updatePayloadForAccount && accountId) {
+        updatePayloadForAccount.enrichment_status = 'Completed';
+        await this._updateAppSheetRecord('Account', accountId, updatePayloadForAccount);
+        Logger.log(`処理完了 (企業情報更新): Account ID ${accountId} を最新情報で更新しました。`);
+      }
 
     } catch (e) {
       Logger.log(`❌ AI提案生成エラー: ${e.message}\n${e.stack}`);
@@ -258,41 +287,60 @@ class SalesCopilot {
   
   /**
    * Google検索を使い、企業情報と参照元URLを取得します。
-   * @param {string} companyName
-   * @param {string} address
-   * @param {string} websiteUrl
-   * @returns {Promise<{summary: string, sourcesMarkdown: string}|null>}
    */
   async _getCompanyInfo(companyName, address, websiteUrl) {
     const task = async () => {
-      const apiKey = PropertiesService.getScriptProperties().getProperty('GOOGLE_API_KEY');
+      const apiKey = this.props[AISALESACTION_CONSTANTS.PROPS_KEY.GOOGLE_API_KEY];
       if (!apiKey || apiKey === 'YOUR_API_KEY_HERE') {
         Logger.log('⚠️ 企業情報のリアルタイム検索はスキップされました。スクリプトプロパティに「GOOGLE_API_KEY」が設定されていません。');
-        return { summary: '(リアルタイム企業情報の検索はスキップされました)', sourcesMarkdown: '' };
+        return null;
       }
 
-      // ★★★ 修正点: 調査の精度を上げるための情報をプロンプトに追加 ★★★
-      let researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。`;
-      if (address) researchPrompt += `\n- 所在地ヒント: ${address}`;
-      if (websiteUrl) researchPrompt += `\n- URLヒント: ${websiteUrl}`;
-      researchPrompt += `\n\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
-      researchPrompt += `\n\nもし、同名の別会社など、複数の候補が見つかり企業の特定が困難な場合は、その旨を回答に含めてください。（例：「株式会社〇〇は複数存在するため、どの企業について調査すべきか特定できませんでした。より詳細な情報（ウェブサイトURLや住所など）を指定してください。」）`;
+      const researchPrompt = `
+        あなたはプロの企業調査アナリストです。
+        以下の企業について、公開情報から徹底的に調査し、指定されたJSON形式で回答してください。
+
+        # 調査対象企業
+        - 会社名: ${companyName}
+        - 所在地ヒント: ${address || '不明'}
+        - URLヒント: ${websiteUrl || '不明'}
+
+        # 収集項目と出力形式 (JSON)
+        - company_description: 事業内容の包括的な説明
+        - main_service: 主要な製品やサービスの概要
+        - hiring_info: 現在の採用情報、特に強化している職種の要約
+        - last_signal_summary: 上記以外の最新ニュースやプレスリリース
+        
+        もし、企業の特定が困難な場合は、その旨をJSONの各値に含めてください。
+        回答はJSONオブジェクトのみとし、前後に説明文などを加えないでください。
+        {
+          "company_description": "...", "main_service": "...", "hiring_info": "...", "last_signal_summary": "..."
+        }
+      `;
 
       const researchClient = new GeminiClient(this.geminiModel);
       researchClient.enableGoogleSearchTool();
       researchClient.setPromptText(researchPrompt);
       const response = await researchClient.generateCandidates();
       
-      const summary = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      let structuredData = null;
+      try {
+        const jsonMatch = responseText.match(/{[\s\S]*}/);
+        if (jsonMatch) {
+          structuredData = JSON.parse(jsonMatch[0]);
+        } else {
+           throw new Error("AIの応答から有効なJSONを抽出できませんでした。");
+        }
+      } catch(e) {
+         Logger.log(`企業情報のJSONパース中にエラー: ${e.message}`);
+         return null;
+      }
       
       let sourcesMarkdown = '';
       const attributions = response.candidates[0].groundingAttributions;
       if (attributions && attributions.length > 0) {
-        const sources = attributions
-          .map(attr => attr.web)
-          .filter(web => web && web.uri)
-          .slice(0, 5); // 最大5件まで
-        
+        const sources = attributions.map(attr => attr.web).filter(web => web && web.uri).slice(0, 5);
         if (sources.length > 0) {
             sourcesMarkdown = "\n\n---\n\n**▼ 調査情報のソース**\n";
             sources.forEach((source, index) => {
@@ -301,21 +349,28 @@ class SalesCopilot {
         }
       }
       
-      Logger.log(`企業情報の調査結果:\n${summary}`);
-      return { summary, sourcesMarkdown };
+      Logger.log(`企業情報の調査結果(JSON):\n${JSON.stringify(structuredData, null, 2)}`);
+      return { structuredData, sourcesMarkdown };
     };
     
     try {
       return await this._apiCallWithRetry(task, "企業情報検索");
     } catch (e) {
       Logger.log(`企業情報の調査中にエラーが発生しました: ${e.message}`);
-      return { summary: '(リアルタイム企業情報の検索中にエラーが発生しました)', sourcesMarkdown: '' };
+      return null;
     }
   }
 
-  /**
-   * 最終的なプロンプトを組み立てます。
-   */
+  _formatCompanyInfoForPrompt(structuredData) {
+    if (!structuredData) return '';
+    let text = '';
+    if (structuredData.company_description) text += `- 事業内容: ${structuredData.company_description}\n`;
+    if (structuredData.main_service) text += `- 主要サービス: ${structuredData.main_service}\n`;
+    if (structuredData.hiring_info) text += `- 採用情報: ${structuredData.hiring_info}\n`;
+    if (structuredData.last_signal_summary) text += `- 最新動向: ${structuredData.last_signal_summary}\n`;
+    return text;
+  }
+  
   _buildFinalPrompt(template, placeholders, contactMethod, probability, accountRecord, organizationRecord, companyInfoFromSearch, referenceContent, historySummary) {
     
     let toneInstruction = '';
@@ -410,19 +465,13 @@ class SalesCopilot {
     return finalPrompt;
   }
 
-  /**
-   * レコードを更新します。
-   */
   async _updateAppSheetRecord(tableName, recordId, fieldsToUpdate) {
-    const recordData = (tableName === 'Account') 
+    const recordData = (tableName === 'Account' || tableName === 'Organization') 
       ? { id: recordId, ...fieldsToUpdate }
       : { ID: recordId, ...fieldsToUpdate };
     return await this.appSheetClient.updateRecords(tableName, [recordData], this.execUserEmail);
   }
 
-  /**
-   * レコードをIDで検索します。
-   */
   async _findRecordById(tableName, recordId) {
     const keyColumn = (tableName === 'Account' || tableName === 'Organization') ? 'id' : 'ID';
     const selector = `FILTER("${tableName}", [${keyColumn}] = "${recordId}")`;
@@ -435,19 +484,16 @@ class SalesCopilot {
     return null;
   }
 
-  /**
-   * API呼び出しを指定回数リトライするヘルパー関数。
-   */
   async _apiCallWithRetry(apiCallFunction, taskName = 'API呼び出し') {
     let lastError;
-    for (let i = 0; i < RETRY_CONFIG.count; i++) {
+    for (let i = 0; i < AISALESACTION_CONSTANTS.RETRY_CONFIG.count; i++) {
       try {
         return await apiCallFunction();
       } catch (e) {
         lastError = e;
-        if (e.message && e.message.includes('status 50')) {
-          const delay = RETRY_CONFIG.delay * Math.pow(2, i);
-          Logger.log(`🔁 ${taskName}で一時的なエラーが発生しました (試行 ${i + 1}/${RETRY_CONFIG.count})。${delay}ms後に再試行します。エラー: ${e.message}`);
+        if (e.message && (e.message.includes('status 50') || e.message.includes('Service invoked too many times'))) {
+          const delay = AISALESACTION_CONSTANTS.RETRY_CONFIG.delay * Math.pow(2, i);
+          Logger.log(`🔁 ${taskName}で一時的なエラーが発生しました (試行 ${i + 1}/${AISALESACTION_CONSTANTS.RETRY_CONFIG.count})。${delay}ms後に再試行します。エラー: ${e.message}`);
           Utilities.sleep(delay);
         } else {
           throw lastError;
@@ -458,7 +504,6 @@ class SalesCopilot {
     throw lastError;
   }
 
-  // 他のヘルパー関数は変更ないため、元の実装を維持します。
   _processUrlInputs(addPrompt, referenceUrls) {
     const combinedUrlsString = [addPrompt, referenceUrls].filter(Boolean).join(',');
     const urlRegex = /https?:\/\/(?:drive|docs)\.google\.com\/(?:file|document|spreadsheets|presentation)\/d\/([a-zA-Z0-9_-]{28,})/g;

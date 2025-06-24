@@ -1,78 +1,84 @@
 /**
  * =================================================================
- * AccountEnricher (調査項目拡張版 v2)
+ * AccountEnricher (v5.3 - 不具合修正・最終版)
  * =================================================================
- * Accountテーブルの新しいスキーマ定義に合わせて、AIによる企業情報の
- * 調査項目を大幅に拡張しました。
+ * 'approach_recommended' の値をTRUE/FALSEのフラグ形式に変換する
+ * 処理が漏れていた不具合を修正しました。
  *
- * 【v2での主な変更点】
- * - 資金調達情報、事業戦略、採用情報、技術スタックなど、アプローチの質を
- * 高めるための戦略的な調査項目を追加。
- * - AIへの指示を更新し、新しい項目を含むすべての情報を構造化データ(JSON)
- * として取得するように修正。
+ * 【v5.3での主な変更点】
+ * - AIが返す「はい」という文字列を、AppSheetが認識できる`TRUE`に変換する
+ * ロジックを再度追加。これにより、データの整合性が保たれます。
  * =================================================================
  */
 
 // =================================================================
 // 定数宣言
 // =================================================================
-const BATCH_PROCESSING_LIMIT = 10; // 一度に処理する最大件数
+const ENRICHER_CONSTANTS = {
+  PROPS_KEY: {
+    SERVICE_ACCOUNT: 'SERVICE_ACCOUNT',
+    APPSHEET_APP_ID: 'APPSHEET_APP_ID',
+    APPSHEET_API_KEY: 'APPSHEET_API_KEY',
+    GEMINI_MODEL: 'GEMINI_MODEL',
+  },
+  DEFAULT_MODEL: 'gemini-2.0-flash',
+  TABLE: {
+    ACCOUNT: 'Account',
+  },
+  COLUMN: {
+    ID: 'id',
+    NAME: 'name',
+    WEBSITE_URL: 'website_url',
+    ADDRESS: 'address',
+    STATUS: 'enrichment_status',
+    APPROACH_RECOMMENDED: 'approach_recommended',
+  },
+  DATE_COLUMNS: [
+    'last_signal_datetime',
+    'establishment_date',
+    'foundation_date',
+    'representative_birth_date',
+  ],
+  STATUS: {
+    PENDING: 'Pending',
+    COMPLETED: 'Completed',
+    FAILED: 'Failed',
+    SKIPPED: 'Skipped',
+  },
+  BATCH_PROCESSING_LIMIT: 10,
+};
+
 
 // =================================================================
-// グローバル関数 (時間主導型トリガーで実行)
+// グローバル関数 (トリガーまたは手動で実行)
 // =================================================================
 
-/**
- * 【時間主導型トリガー用】企業情報収集バッチ処理を実行します。
- */
 function runAccountEnrichmentBatch() {
-  const execUserEmail = "hello@al-pa-ca.com"//PropertiesService.getScriptProperties().getProperty('SERVICE_ACCOUNT');
-  
+  const execUserEmail = PropertiesService.getScriptProperties().getProperty(ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT);
   if (!execUserEmail) {
-    Logger.log('❌ エラー: スクリプトプロパティに "SERVICE_ACCOUNT" が設定されていません。バッチ処理を実行できません。');
+    Logger.log(`❌ エラー: スクリプトプロパティに "${ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT}" が設定されていません。`);
     return;
   }
-
-  Logger.log(`企業情報収集バッチをサービスアカウント (${execUserEmail}) で開始します。`);
-  
+  Logger.log(`[START] 企業情報収集バッチをサービスアカウント (${execUserEmail}) で開始します。`);
   try {
     const enricher = new AccountEnricher(execUserEmail);
-    enricher.enrichAllPendingAccounts()
-      .catch(e => {
-        Logger.log(`❌ バッチ処理の実行中に致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
-      });
+    enricher.enrichAllPendingAccounts().catch(e => Logger.log(`❌ バッチ処理エラー: ${e.message}\n${e.stack}`));
   } catch (e) {
-    Logger.log(`❌ 初期化中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    Logger.log(`❌ 初期化エラー: ${e.message}\n${e.stack}`);
   }
 }
 
-/**
- * 【AppSheetから実行】指定された1つのアカウント情報を強制的に更新します。
- * @param {string} accountId - 更新対象のアカウントID。
- * @param {string} execUserEmail - 実行ユーザーのメールアドレス。
- */
 function enrichSingleAccount(accountId, execUserEmail) {
-  accountId = "9250CC98-C95A-43D9-B261-E7EFD163B5E3-b3ac984e";
-  execUserEmail = "hello@al-pa-ca.com"
-  if (!accountId) {
-    Logger.log('❌ エラー: accountIdが指定されていません。');
+  if (!accountId || !execUserEmail) {
+    Logger.log(`❌ [ERROR] 引数が不足しています。accountId: ${accountId}, execUserEmail: ${execUserEmail}`);
     return;
   }
-  if (!execUserEmail) {
-    Logger.log('❌ エラー: execUserEmailが指定されていません。');
-    return;
-  }
-  
-  Logger.log(`アカウント個別更新を開始します。Account ID: ${accountId}`);
-
+  Logger.log(`[START] アカウント個別更新を開始します。Account ID: ${accountId}, 実行者: ${execUserEmail}`);
   try {
     const enricher = new AccountEnricher(execUserEmail);
-    enricher.processSingleAccount(accountId)
-      .catch(e => {
-        Logger.log(`❌ アカウント個別更新中にエラーが発生しました (ID: ${accountId}): ${e.message}\n${e.stack}`);
-      });
+    enricher.processSingleAccount(accountId).catch(e => Logger.log(`❌ 個別更新エラー: ${e.message}\n${e.stack}`));
   } catch (e) {
-    Logger.log(`❌ 初期化中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    Logger.log(`❌ 初期化エラー: ${e.message}\n${e.stack}`);
   }
 }
 
@@ -85,196 +91,231 @@ class AccountEnricher {
   constructor(execUserEmail) {
     this.execUserEmail = execUserEmail;
     this.props = PropertiesService.getScriptProperties().getProperties();
-    this.appSheetClient = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
-    this.geminiClient = new GeminiClient('gemini-2.0-flash');
-  }
+    
+    const appId = this.props[ENRICHER_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID];
+    const apiKey = this.props[ENRICHER_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY];
+    const geminiModel = this.props[ENRICHER_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || ENRICHER_CONSTANTS.DEFAULT_MODEL;
 
-  /**
-   * 保留中のすべてのアカウントに対して情報収集を実行するメインメソッド。
-   */
-  async enrichAllPendingAccounts() {
-    const pendingAccounts = await this._findPendingAccounts();
-
-    if (!pendingAccounts || pendingAccounts.length === 0) {
-      Logger.log('情報収集対象のアカウントはありませんでした。処理を終了します。');
-      return;
+    if (!appId || !apiKey) {
+      throw new Error('AppSheetのApp IDまたはAPIキーがスクリプトプロパティに設定されていません。');
     }
 
-    Logger.log(`${pendingAccounts.length}件のアカウントの情報収集を開始します。`);
-
-    for (const account of pendingAccounts) {
-      await this.processSingleAccount(account.id);
-    }
-    Logger.log('すべてのアカウントの情報収集処理が完了しました。');
+    this.appSheetClient = new AppSheetClient(appId, apiKey);
+    this.geminiClient = new GeminiClient(geminiModel);
+    Logger.log(`✅ AccountEnricherの初期化完了 (使用モデル: ${geminiModel})`);
   }
 
-  /**
-   * 指定された単一のアカウント情報を収集・更新します。
-   * @param {string} accountId - 更新対象のアカウントID。
-   */
   async processSingleAccount(accountId) {
     try {
-      const account = await this._findRecordById('Account', accountId);
-      if (!account) {
-        throw new Error(`ID: ${accountId} のアカウントが見つかりませんでした。`);
-      }
+      Logger.log(`[1/4] Account ID [${accountId}] のレコード情報を取得中...`);
+      const account = await this._findRecordById(ENRICHER_CONSTANTS.TABLE.ACCOUNT, accountId);
+      if (!account) throw new Error(`レコードが見つかりませんでした。`);
+      Logger.log(`  -> ✅ 取得成功。`);
 
-      const companyName = account.name;
+      const companyName = account[ENRICHER_CONSTANTS.COLUMN.NAME];
       if (!companyName) {
-        Logger.log(`ID: ${account.id} には会社名(name)がないためスキップします。`);
-        await this._updateAccountStatus(account.id, 'Skipped');
+        Logger.log(`[SKIP] ID: ${accountId} には会社名がないためスキップします。`);
+        await this._updateAccountStatus(accountId, ENRICHER_CONSTANTS.STATUS.SKIPPED);
         return;
       }
       
-      Logger.log(`処理中: Account ID [${account.id}], 会社名 [${companyName}]`);
-
-      // 既存のメソッドを再利用して情報収集
-      const enrichedData = await this._enrichAccountData(companyName, account.website_url);
+      Logger.log(`[2/4] 会社名 [${companyName}] の情報をAIで調査中...`);
+      const websiteUrl = account[ENRICHER_CONSTANTS.COLUMN.WEBSITE_URL];
+      const address = account[ENRICHER_CONSTANTS.COLUMN.ADDRESS];
+      const enrichedData = await this._enrichWithAI(companyName, address, websiteUrl);
       
       if (enrichedData) {
-        enrichedData.enrichment_status = 'Completed';
-        await this._updateAccountInAppSheet(account.id, enrichedData);
-        Logger.log(`-> 成功: Account ID [${account.id}] の情報を更新しました。`);
+        Logger.log(`  -> ✅ AIからの情報取得成功。`);
+        Logger.log(`[3/4] 取得データをAppSheet用に整形(サニタイズ)中...`);
+        const sanitizedData = this._sanitizeDataForAppSheet(enrichedData);
+        Logger.log(`  -> ✅ 整形完了。`);
+
+        Logger.log(`[4/4] AppSheetのレコードを更新中...`);
+        sanitizedData[ENRICHER_CONSTANTS.COLUMN.STATUS] = ENRICHER_CONSTANTS.STATUS.COMPLETED;
+        await this._updateAccountInAppSheet(accountId, sanitizedData);
+        Logger.log(`[SUCCESS] ✅ Account ID [${accountId}] の情報更新が正常に完了しました。`);
+
       } else {
-        await this._updateAccountStatus(account.id, 'Failed');
-        Logger.log(`-> 失敗: Account ID [${account.id}] の情報収集に失敗しました。ステータスを'Failed'に更新します。`);
+        await this._updateAccountStatus(accountId, ENRICHER_CONSTANTS.STATUS.FAILED);
+        Logger.log(`[FAIL] AIからの情報収集に失敗しました。ステータスを'Failed'に更新します。`);
       }
     } catch (error) {
-      Logger.log(`-> エラー: Account ID [${accountId}] の個別更新処理中に予期せぬエラーが発生しました: ${error.stack}`);
-      // 失敗した場合でもステータス更新を試みる
-      await this._updateAccountStatus(accountId, 'Failed').catch(e => Logger.log(`ステータス更新にも失敗しました: ${e.message}`));
+      Logger.log(`❌ [ERROR] Account ID [${accountId}] の処理中にエラー: ${error.stack}`);
+      await this._updateAccountStatus(accountId, ENRICHER_CONSTANTS.STATUS.FAILED).catch(e => Logger.log(`  -> ⚠️ ステータス更新にも失敗: ${e.message}`));
     }
   }
 
+  async _enrichWithAI(companyName, address, websiteUrl) {
+    const prompt = `
+      あなたはプロの企業調査アナリストです。
+      以下の企業について、公開情報から徹底的に調査し、指定されたJSON形式で回答してください。
+      このデータは日本のビジネスユーザー向けのアプリケーションで利用されるため、回答の品質が非常に重要です。
 
-  /**
-   * AppSheetから情報収集が保留中（Pending）のアカウントを取得します。
-   */
-  async _findPendingAccounts() {
-    const selector = `FILTER("Account", [enrichment_status] = "Pending")`;
-    const properties = { 
-      "Selector": selector,
-      "Properties": { "PageSize": BATCH_PROCESSING_LIMIT, "Locale": "ja-JP" }
-    };
-    
+      # 調査対象企業
+      - 会社名: ${companyName}
+      - 所在地ヒント: ${address || '不明'}
+      - URLヒント: ${websiteUrl || '不明'}
+
+      # 収集項目とルール
+      - 【言語ルール】: すべての回答は、必ず自然で流暢な日本語で記述してください。英語、ロシア語(例: основ)、韓国語(例: 다양한)など、日本語以外の言語や不自然な記号を絶対に混ぜないでください。
+      - 【欠損データ】: 見つからない情報は null を返してください。
+      - 【日付形式】: 日付に関する項目は「YYYY-MM-DD」形式で回答してください。
+      - 【フラグ形式】: "approach_recommended" には、「はい」か「いいえ」のいずれか一つだけを回答してください。
+
+      # 出力形式 (JSONのみを回答)
+      {
+        "industry": "...", "company_size": "...", "company_description": "...", "corporate_number": "...",
+        "website_url": "...", "linkedin_url": "...", "main_service": "...", "target_audience": "...",
+        "intent_keyword": "...", "last_signal_type": "...", "last_signal_datetime": "...", "last_signal_summary": "...",
+        "approach_recommended": "はい", "funding_ir_info": "...", "business_strategy": "...", "hiring_info": "...",
+        "tech_stack": "...", "customer_case_studies": "...", "event_info": "...", "listing_status": "...",
+        "capital_stock": "...", "establishment_date": "...", "foundation_date": "...", "legal_entity_type": "...",
+        "representative_name": "...", "representative_title": "...", "representative_birth_date": "...",
+        "representative_background": "...", "representative_career": "...", "shareholder_composition": "...",
+        "main_suppliers": "...", "main_customers": "...", "facilities_overview": "...", "company_overview": "...",
+        "business_strengths": "...", "business_weaknesses": "...", "future_outlook": "..."
+      }
+      
+      # 最終確認
+      生成したJSONの各値が、上記のルール（特に言語ルール）に従っていることを必ず確認してください。`;
+
     try {
-      const results = await this.appSheetClient.findData('Account', this.execUserEmail, properties);
-      return (results && Array.isArray(results)) ? results : [];
-    } catch (e) {
-      Logger.log(`AppSheetからのデータ取得に失敗しました: ${e.message}`);
-      return [];
+      this.geminiClient.enableGoogleSearchTool();
+      this.geminiClient.setPromptText(prompt);
+      const response = await this.geminiClient.generateCandidates();
+      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      
+      const firstBrace = responseText.indexOf('{');
+      const lastBrace = responseText.lastIndexOf('}');
+      if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+        throw new Error("AIの応答から有効なJSONオブジェクトを抽出できませんでした。");
+      }
+      const jsonString = responseText.substring(firstBrace, lastBrace + 1);
+      
+      return JSON.parse(jsonString);
+
+    } catch (error) {
+      Logger.log(`❌ [ERROR] Geminiでの情報収集またはJSONパース中にエラー: ${error.stack}`);
+      return null;
     }
   }
 
-  /**
-   * レコードをIDで検索します。
-   */
+  _sanitizeDataForAppSheet(data) {
+    const sanitized = {};
+    for (const key in data) {
+      if (data[key] === '不明') {
+        sanitized[key] = null;
+      } else {
+        sanitized[key] = data[key];
+      }
+    }
+
+    // ★ v5.3 修正点: Yes/No型の変換処理を追加
+    const yesNoKey = ENRICHER_CONSTANTS.COLUMN.APPROACH_RECOMMENDED;
+    if (sanitized.hasOwnProperty(yesNoKey)) {
+        const originalValue = sanitized[yesNoKey];
+        sanitized[yesNoKey] = (originalValue === 'はい');
+        Logger.log(`  -> サニタイズ: "${yesNoKey}" の "${originalValue}" を ${sanitized[yesNoKey]} に変換しました。`);
+    }
+
+    ENRICHER_CONSTANTS.DATE_COLUMNS.forEach(key => {
+        if (sanitized[key]) {
+            sanitized[key] = this._formatDateString(sanitized[key]);
+        }
+    });
+
+    sanitized.website_url = this._formatUrl(sanitized.website_url);
+    sanitized.linkedin_url = this._formatUrl(sanitized.linkedin_url);
+    
+    return sanitized;
+  }
+  
+  _formatUrl(urlString) {
+    if (!urlString || typeof urlString !== 'string' || urlString.trim().toLowerCase() === 'null' || urlString.trim() === '') return null;
+    let trimmedUrl = urlString.trim();
+    if (!/^https?:\/\//i.test(trimmedUrl)) {
+      trimmedUrl = `https://${trimmedUrl}`;
+    }
+    try {
+      new URL(trimmedUrl);
+      return trimmedUrl;
+    } catch (_) {
+      return null;
+    }
+  }
+  
+  _formatDateString(dateString) {
+      if (!dateString || typeof dateString !== 'string') return null;
+      const ymdMatch = dateString.match(/(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?/);
+      if (ymdMatch) {
+          const year = ymdMatch[1];
+          const month = ymdMatch[2].padStart(2, '0');
+          const day = ymdMatch[3].padStart(2, '0');
+          return `${year}/${month}/${day}`;
+      }
+      return dateString;
+  }
+
+  async _updateAccountInAppSheet(accountId, data) {
+    const rowToUpdate = {
+      [ENRICHER_CONSTANTS.COLUMN.ID]: accountId,
+      ...data
+    };
+    Logger.log(`  -> 🔄 AppSheetへの更新ペイロード:\n${JSON.stringify(rowToUpdate, null, 2)}`);
+    await this.appSheetClient.updateRecords(ENRICHER_CONSTANTS.TABLE.ACCOUNT, [rowToUpdate], this.execUserEmail);
+  }
+  
+  async _updateAccountStatus(accountId, status) {
+    try {
+      Logger.log(`[INFO] Account ID [${accountId}] のステータスを "${status}" に更新します。`);
+      await this._updateAccountInAppSheet(accountId, { [ENRICHER_CONSTANTS.COLUMN.STATUS]: status });
+    } catch (error) {
+      Logger.log(`❌ [ERROR] Account ID [${accountId}] のステータス更新中にエラー: ${error.stack}`);
+    }
+  }
+
+  async enrichAllPendingAccounts() {
+    Logger.log("⏳ 保留中のアカウントを検索中...");
+    const pendingAccounts = await this._findPendingAccounts();
+
+    if (!pendingAccounts || pendingAccounts.length === 0) {
+      Logger.log("✅ 情報収集対象のアカウントはありませんでした。");
+      return;
+    }
+
+    Logger.log(`[INFO] ${pendingAccounts.length}件のアカウントの情報収集を開始します。`);
+
+    for (const account of pendingAccounts) {
+      await this.processSingleAccount(account[ENRICHER_CONSTANTS.COLUMN.ID]);
+    }
+    
+    Logger.log("[END] すべてのアカウントの情報収集処理が完了しました。");
+  }
+
   async _findRecordById(tableName, recordId) {
-    const keyColumn = 'id'; // Accountテーブルのキーは 'id'
+    const keyColumn = ENRICHER_CONSTANTS.COLUMN.ID;
     const selector = `FILTER("${tableName}", [${keyColumn}] = "${recordId}")`;
     const properties = { "Selector": selector };
     const result = await this.appSheetClient.findData(tableName, this.execUserEmail, properties);
     if (result && Array.isArray(result) && result.length > 0) {
       return result[0];
     }
-    Logger.log(`テーブル[${tableName}]からID[${recordId}]のレコードが見つかりませんでした。応答: ${JSON.stringify(result)}`);
+    Logger.log(`[WARN] テーブル[${tableName}]からID[${recordId}]のレコードが見つかりませんでした。`);
     return null;
   }
 
-
-  /**
-   * AI（Gemini）を用いて企業の詳細情報を収集します。
-   */
-  async _enrichAccountData(companyName, websiteUrl) {
-    // ★★★ 修正点: company_sizeの指示をText型を許容する形に戻しました ★★★
-    const prompt = `
-      あなたはプロの企業調査アナリストです。
-      以下の企業について、公開情報から徹底的に調査し、指定されたJSON形式で回答してください。
-
-      # 調査対象企業
-      - 会社名: ${companyName}
-      - ウェブサイト: ${websiteUrl || '不明'}
-
-      # 収集項目
-      ## 基本情報
-      - company_description: 事業内容の包括的な説明
-      - corporate_number: 法人番号
-      - main_service: 主要な製品やサービスの概要
-      - industry: 業種
-      - company_size: 企業規模・従業員数
-      - target_audience: ターゲット顧客
-      - linkedin_url: LinkedInの企業ページURL
-
-      ## 戦略・財務情報
-      - funding_ir_info: 直近の資金調達の状況や、投資家向け(IR)情報の要約
-      - business_strategy: 中期経営計画や今後の事業戦略の要約
-
-      ## 人材・技術情報
-      - hiring_info: 現在の採用情報、特に強化している職種の要約
-      - tech_stack: Webサイトや採用情報から推測される利用技術 (例: AWS, Salesforce, React)
-
-      ## マーケティング・広報情報
-      - customer_case_studies: 顧客向けの導入事例や成功事例の要約
-      - event_info: 直近のセミナー登壇やイベント出展情報の要約
-      - last_signal_summary: 上記以外の最新ニュースやプレスリリース
-
-      # 出力形式 (JSON)
-      見つからない情報は "不明" または null としてください。
-      {
-        "company_description": "...",
-        "corporate_number": "...",
-        "main_service": "...",
-        "industry": "...",
-        "company_size": "...",
-        "target_audience": "...",
-        "linkedin_url": "...",
-        "funding_ir_info": "...",
-        "business_strategy": "...",
-        "hiring_info": "...",
-        "tech_stack": "...",
-        "customer_case_studies": "...",
-        "event_info": "...",
-        "last_signal_summary": "..."
-      }
-    `;
-
-    try {
-      this.geminiClient.setPromptText(prompt);
-      const response = await this.geminiClient.generateCandidates();
-      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
-      
-      const jsonMatch = responseText.match(/{[\s\S]*}/);
-      if (!jsonMatch) {
-        throw new Error("AIの応答から有効なJSONを抽出できませんでした。");
-      }
-      return JSON.parse(jsonMatch[0]);
-
-    } catch (error) {
-      Logger.log(`Geminiでの情報収集またはJSONパース中にエラーが発生しました (会社名: ${companyName}): ${error.stack}`);
-      return null;
-    }
-  }
-
-  /**
-   * 収集したデータでAppSheetのレコードを更新します。
-   */
-  async _updateAccountInAppSheet(accountId, data) {
-    const rowToUpdate = {
-      id: accountId, // Accountテーブルのキーは 'id'
-      ...data
+  async _findPendingAccounts() {
+    const selector = `FILTER("${ENRICHER_CONSTANTS.TABLE.ACCOUNT}", [${ENRICHER_CONSTANTS.COLUMN.STATUS}] = "${ENRICHER_CONSTANTS.STATUS.PENDING}")`;
+    const properties = { 
+      "Selector": selector,
+      "Properties": { "PageSize": ENRICHER_CONSTANTS.BATCH_PROCESSING_LIMIT, "Locale": "ja-JP" }
     };
-    
-    await this.appSheetClient.updateRecords('Account', [rowToUpdate], this.execUserEmail);
-  }
-  
-  /**
-   * アカウントのステータスのみを更新します（主にエラー発生時に使用）。
-   */
-  async _updateAccountStatus(accountId, status) {
     try {
-      await this._updateAccountInAppSheet(accountId, { enrichment_status: status });
-    } catch (error) {
-      Logger.log(`Account ID [${accountId}] のステータス更新中にエラーが発生しました: ${error.stack}`);
+      const results = await this.appSheetClient.findData(ENRICHER_CONSTANTS.TABLE.ACCOUNT, this.execUserEmail, properties);
+      return (results && Array.isArray(results)) ? results : [];
+    } catch (e) {
+      Logger.log(`❌ [ERROR] AppSheetからのデータ取得に失敗しました: ${e.message}`);
+      return [];
     }
   }
 }
