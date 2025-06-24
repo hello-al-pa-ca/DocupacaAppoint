@@ -1,14 +1,15 @@
 /**
- * @fileoverview AppSheetからトリガーされる名刺情報抽出・更新バックエンド (バッチ処理対応版)
- * @version 5.0.0
- * @description
- * 名刺情報抽出と、ドメイン/会社名によるアカウント連携に特化したスクリプト。
- * 時間のかかる企業情報の自動収集機能は分離し、バッチ処理に移行。
+ * =================================================================
+ * Business Card Extraction (v19.0.0)
+ * =================================================================
+ * v18をベースに、BusinessCardテーブルから`corporateNumber`カラムが
+ * 削除された仕様変更に対応しました。
  *
- * 【v5.0.0での主な変更点】
- * - パフォーマンス向上のため、アカウント新規作成時のAIによる企業情報収集処理を削除。
- * - 代わりに、新規作成されたアカウントに `enrichment_status` = 'Pending' を設定し、
- * 別のバッチ処理スクリプトが後から情報を補完できるようにした。
+ * 【v19.0.0での主な変更点】
+ * - AIへの抽出指示プロンプトから`corporateNumber`を削除。
+ * - AppSheetのAccountテーブル、BusinessCardテーブルを更新する際の
+ * ペイロードから`corporateNumber`を削除し、エラーを解消。
+ * =================================================================
  */
 
 // =================================================================
@@ -56,6 +57,7 @@ const PROMPT_USER_INSTRUCTION = `Follow the rules and the provided Schema below 
   - **(Select):** If the description starts with \`(Select)\`, you must choose the most appropriate value from the list provided in square brackets \`[A, B, C]\`.
   - **No Prefix:** Extract the information as it is written on the image.
 * **format:** If a 'format' is specified in the Schema, strictly follow it (e.g.,<x_bin_880>/MM/dd, regex).
+* **URL Format:** For the 'link1' and 'link2' fields, you must output the full URL including 'https://' or 'http://'. Do not output just the domain name.
 * **Multiple Images:** If two images are provided, they represent the front and back of the business card. Consolidate information from both images to provide the most complete and accurate data.
 * **Non-existent Fields:** If you cannot find the information for a field, output an empty string \`""\`.
 * **Output Format:** You must output **only a single, raw JSON object** and nothing else. Do not include any explanatory text or markdown formatting like \`\`\`json.
@@ -77,7 +79,6 @@ const PROMPT_USER_INSTRUCTION = `Follow the rules and the provided Schema below 
   "faxNumber": "",
   "link1": "https://cloud.google.com/",
   "link2": "",
-  "corporateNumber": "1011001089234",
   "ocrFront": "Google Japan G.K. Software Engineer Taro Yamada ...",
   "ocrBack": "",
   "otherNotes": "Met at the tech conference."
@@ -197,6 +198,10 @@ async function processBusinessCard(tableName, fileIds, recordId, execUser) {
   }
   console.log('データ抽出完了:', extractedData);
 
+  extractedData.link1 = _formatUrl(extractedData.link1);
+  extractedData.link2 = _formatUrl(extractedData.link2);
+
+
   // --- 3. アカウントの検索または作成 ---
   const appSheetClient = new AppSheetClient(APPSHEET_APP_ID, APPSHEET_API_KEY);
   const accountId = await _findOrCreateAccount(appSheetClient, extractedData, execUser);
@@ -214,9 +219,12 @@ async function processBusinessCard(tableName, fileIds, recordId, execUser) {
   const image_path_back = processedImageFiles[1] ? `${APPSHEET_IMAGE_FOLDER_NAME}/${processedImageFiles[1].getName()}` : "";
   const now = new Date();
 
+  // ★★★ 修正点: 更新ペイロードから corporateNumber を削除 ★★★
+  const { corporateNumber, ...restOfExtractedData } = extractedData;
+
   // 更新用データオブジェクトを作成
   const recordToUpdate = {
-    ...extractedData,
+    ...restOfExtractedData,
     [APPSHEET_KEY_COLUMN_NAME]: recordId,
     account_id: accountId, 
     latitude: location.latitude,
@@ -224,7 +232,7 @@ async function processBusinessCard(tableName, fileIds, recordId, execUser) {
     acquisitionDatetime: Utilities.formatDate(now, 'JST', 'yyyy/MM/dd HH:mm:ss'),
     image_path_front: image_path_front,
     image_path_back: image_path_back,
-    importStatus: '',
+    importStatus: '完了', // ステータスを完了に
   };
   if (recordToUpdate.gender === '不明') {
     recordToUpdate.gender = '';
@@ -295,9 +303,10 @@ async function _findOrCreateAccount(client, cardData, userEmail) {
       phone_number: cardData.phoneNumber,
       fax_number: cardData.faxNumber,
       note: cardData.otherNotes,
-      corporate_number: cardData.corporateNumber,
+      // ★★★ 修正点: corporateNumberをペイロードから削除 ★★★
+      // corporate_number: cardData.corporateNumber, 
       website_url: cardData.link1,
-      enrichment_status: 'Pending' // ★★★ バッチ処理の対象とするためのステータス ★★★
+      enrichment_status: 'Pending'
     };
     
     const addResponse = await client.addRecords("Account", [newAccountPayload], userEmail);
@@ -307,19 +316,38 @@ async function _findOrCreateAccount(client, cardData, userEmail) {
         console.log(`新規アカウントを作成しました: ${newAccountId}`);
         return newAccountId;
     } else {
-       throw new Error("新規アカウントの作成に成功しましたが、応答からIDを取得できませんでした。");
+        throw new Error("新規アカウントの作成に成功しましたが、応答からIDを取得できませんでした。");
     }
   } catch (e) {
     console.error(`アカウントの検索または作成中にエラーが発生しました: ${e.stack}`);
-    return null;
+    // エラーを再スローして、上位のcatchで処理させる
+    throw e;
   }
 }
 
 /**
- * メールアドレスからドメインを抽出する。一般的なフリーメールは除外。
- * @param {string} email - メールアドレス。
- * @returns {string|null} - 抽出したドメイン、またはnull。
- * @private
+ * URLを適切な形式に整形するヘルパー関数。
+ */
+function _formatUrl(urlString) {
+  if (!urlString || typeof urlString !== 'string' || urlString.trim() === '') {
+    return null;
+  }
+  let trimmedUrl = urlString.trim();
+  if (!/^https?:\/\//i.test(trimmedUrl)) {
+    trimmedUrl = `https://${trimmedUrl}`;
+  }
+  try {
+    new URL(trimmedUrl);
+    return trimmedUrl;
+  } catch (_) {
+    Logger.log(`無効なURL形式のためスキップします: ${urlString}`);
+    return null;
+  }
+}
+
+
+/**
+ * メールアドレスからドメインを抽出する。
  */
 function _extractDomainFromEmail(email) {
   if (!email || !email.includes('@')) return null;
@@ -331,7 +359,7 @@ function _extractDomainFromEmail(email) {
   ];
 
   if (freeEmailDomains.includes(domain.toLowerCase())) {
-    return null; // フリーメールの場合はnullを返す
+    return null;
   }
   
   return domain;
@@ -340,9 +368,6 @@ function _extractDomainFromEmail(email) {
 
 /**
  * 住所文字列から緯度・経度を取得する
- * @param {string} address - 変換したい住所
- * @returns {{latitude: number|string, longitude: number|string}} 緯度経度オブジェクト
- * @private
  */
 function getLatLngFromAddress_(address) {
   try {
@@ -367,7 +392,6 @@ function getLatLngFromAddress_(address) {
 
 /**
  * 指定されたフォルダ内でファイル名からファイルIDを検索します。
- * @private
  */
 function findFileIdByName(folderId, fileName) {
   if (!folderId || !fileName) return null;
@@ -388,7 +412,7 @@ function findFileIdByName(folderId, fileName) {
 }
 
 /**
- * スプレッドシートからSchema定義を読み込む。パフォーマンス向上のためキャッシュを利用。
+ * スプレッドシートからSchema定義を読み込む。
  */
 function getSchemaFromSheet() {
   const cache = CacheService.getScriptCache();
@@ -404,8 +428,11 @@ function getSchemaFromSheet() {
   const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 4).getValues();
   const schema = {};
   data.forEach(row => {
-    const key = row[0], label = row[1], description = row[2], format = row[3];
-    if (key) schema[key] = { label, description, format };
+    // ★★★ 修正点: corporateNumberをスキーマから除外 ★★★
+    const key = row[0];
+    if (key && key !== 'corporateNumber') {
+      schema[key] = { label: row[1], description: row[2], format: row[3] };
+    }
   });
   cache.put(cacheKey, JSON.stringify(schema), 21600);
   return schema;

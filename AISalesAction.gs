@@ -1,14 +1,13 @@
 /**
  * =================================================================
- * AI Sales Action (リファクタリング版 v22)
+ * AI Sales Action (リファクタリング版 v19)
  * =================================================================
- * v18をベースに、Gemini APIの一時的な高負荷(503エラー)に対応するため、
- * 指数関数的バックオフを用いたリトライ機能を実装しました。
+ * v18をベースに、企業調査の精度向上とソース表示機能を追加しました。
  *
- * 【v22での主な変更点】
- * - API呼び出しが5xxエラーで失敗した際に、待ち時間を指数関数的に増やして
- * 再試行するよう`_apiCallWithRetry`関数を強化しました。
- * - これにより、APIサーバーの一時的な高負荷に対する耐性が向上します。
+ * 【v19での主な変更点】
+ * - 企業調査時に住所やURLを付加情報として利用し、調査対象の特定精度を向上。
+ * - 調査対象が曖昧な場合にAIが警告を出すよう、プロンプトを改善。
+ * - リアルタイム調査の参照元URLを、クリック可能なリンクリストとして表示する機能を追加。
  * =================================================================
  */
 
@@ -142,7 +141,9 @@ class SalesCopilot {
 
       const { processedAddPrompt, referenceContent, markdownLinkList } = this._processUrlInputs(addPrompt, referenceUrls);
       
-      const companyInfoFromSearch = companyName ? await this._getCompanyInfo(companyName) : null;
+      const companyInfoResult = companyName ? await this._getCompanyInfo(companyName, companyAddress, accountRecord?.website_url) : null;
+      const companyInfoFromSearch = companyInfoResult ? companyInfoResult.summary : '';
+      const searchSourcesMarkdown = companyInfoResult ? companyInfoResult.sourcesMarkdown : '';
       
       const placeholders = {
         '[顧客の会社名]': companyName,
@@ -166,7 +167,7 @@ class SalesCopilot {
       geminiClient.setSystemInstructionText(aiRoleDescription);
       geminiClient.setPromptText(finalPrompt);
 
-      const response = await this._apiCallWithRetry(async () => await geminiClient.generateCandidates(), "メール本文生成");
+      const response = await this._apiCallWithRetry(async () => await geminiClient.generateCandidates());
 
       const generatedText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
       if (!generatedText) throw new Error('Geminiからの応答が空でした。');
@@ -174,7 +175,7 @@ class SalesCopilot {
       const formattedData = this._formatResponse(generatedText, contactMethod);
       
       const updatePayload = {
-        "suggest_ai_text": formattedData.suggest_ai_text,
+        "suggest_ai_text": formattedData.suggest_ai_text + searchSourcesMarkdown, // ソース情報を追記
         "subject": formattedData.subject,
         "body": formattedData.body,
         "execute_ai_status": "提案済み",
@@ -183,17 +184,6 @@ class SalesCopilot {
       
       await this._updateAppSheetRecord('SalesAction', recordId, updatePayload);
       Logger.log(`処理完了 (AI提案生成): Record ID ${recordId}`);
-      
-      if (customerId && companyInfoFromSearch) {
-        Logger.log(`Accountテーブルの情報を最新化します (ID: ${customerId})`);
-        const accountUpdatePayload = {
-          id: customerId,
-          ...companyInfoFromSearch
-        };
-        console.log(accountUpdatePayload);
-        this._updateAppSheetRecord('Account', customerId, accountUpdatePayload)
-          .catch(e => Logger.log(`Accountテーブルの更新に失敗しました: ${e.message}`));
-      }
 
     } catch (e) {
       Logger.log(`❌ AI提案生成エラー: ${e.message}\n${e.stack}`);
@@ -208,8 +198,8 @@ class SalesCopilot {
     try {
       const completedAction = await this._findRecordById('SalesAction', completedActionId);
       if (!completedAction) throw new Error(`ID ${completedActionId} のアクションが見つかりません。`);
-
-      const accountId = completedAction.accountId; 
+      
+      const accountId = completedAction.accountId;
       if(!accountId) {
         Logger.log(`警告: 完了アクション[${completedActionId}]にアカウントIDが紐付いていません。`);
         return;
@@ -267,54 +257,59 @@ class SalesCopilot {
   }
   
   /**
-   * Google検索を使い、企業情報を構造化データとして取得します。
+   * Google検索を使い、企業情報と参照元URLを取得します。
+   * @param {string} companyName
+   * @param {string} address
+   * @param {string} websiteUrl
+   * @returns {Promise<{summary: string, sourcesMarkdown: string}|null>}
    */
-  async _getCompanyInfo(companyName) {
-     const task = async () => {
+  async _getCompanyInfo(companyName, address, websiteUrl) {
+    const task = async () => {
       const apiKey = PropertiesService.getScriptProperties().getProperty('GOOGLE_API_KEY');
       if (!apiKey || apiKey === 'YOUR_API_KEY_HERE') {
         Logger.log('⚠️ 企業情報のリアルタイム検索はスキップされました。スクリプトプロパティに「GOOGLE_API_KEY」が設定されていません。');
-        return null;
+        return { summary: '(リアルタイム企業情報の検索はスキップされました)', sourcesMarkdown: '' };
       }
-      
-      const researchPrompt = `
-        以下の企業について、公開情報を調査し、指定されたJSON形式で回答してください。
-        会社名: ${companyName}
-        
-        # 収集項目
-        - 事業内容 (company_description)
-        - 主な製品やサービス (main_service)
-        - 最新のニュースやプレスリリース (last_signal_summary)
-        
-        # 出力形式 (JSON)
-        見つからない情報は "不明" としてください。
-        {
-          "company_description": "...",
-          "main_service": "...",
-          "last_signal_summary": "..."
-        }
-      `;
+
+      // ★★★ 修正点: 調査の精度を上げるための情報をプロンプトに追加 ★★★
+      let researchPrompt = `${companyName}の企業情報について、ウェブサイトや公開情報から以下の点を簡潔にまとめてください。`;
+      if (address) researchPrompt += `\n- 所在地ヒント: ${address}`;
+      if (websiteUrl) researchPrompt += `\n- URLヒント: ${websiteUrl}`;
+      researchPrompt += `\n\n- 事業内容\n- 主な製品やサービス\n- 最新のニュースやプレスリリース（1〜2件）`;
+      researchPrompt += `\n\nもし、同名の別会社など、複数の候補が見つかり企業の特定が困難な場合は、その旨を回答に含めてください。（例：「株式会社〇〇は複数存在するため、どの企業について調査すべきか特定できませんでした。より詳細な情報（ウェブサイトURLや住所など）を指定してください。」）`;
 
       const researchClient = new GeminiClient(this.geminiModel);
-      researchClient.enableGoogleSearchTool(); 
+      researchClient.enableGoogleSearchTool();
       researchClient.setPromptText(researchPrompt);
-      
       const response = await researchClient.generateCandidates();
-      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
       
-      Logger.log(`企業情報の調査結果(生データ):\n${responseText}`);
-      const jsonMatch = responseText.match(/{[\s\S]*}/);
-      if (!jsonMatch) {
-          throw new Error("AIの応答から有効なJSONを抽出できませんでした。");
+      const summary = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      
+      let sourcesMarkdown = '';
+      const attributions = response.candidates[0].groundingAttributions;
+      if (attributions && attributions.length > 0) {
+        const sources = attributions
+          .map(attr => attr.web)
+          .filter(web => web && web.uri)
+          .slice(0, 5); // 最大5件まで
+        
+        if (sources.length > 0) {
+            sourcesMarkdown = "\n\n---\n\n**▼ 調査情報のソース**\n";
+            sources.forEach((source, index) => {
+                sourcesMarkdown += `${index + 1}. [${source.title || source.uri}](${source.uri})\n`;
+            });
+        }
       }
-      return JSON.parse(jsonMatch[0]);
+      
+      Logger.log(`企業情報の調査結果:\n${summary}`);
+      return { summary, sourcesMarkdown };
     };
-
+    
     try {
       return await this._apiCallWithRetry(task, "企業情報検索");
     } catch (e) {
       Logger.log(`企業情報の調査中にエラーが発生しました: ${e.message}`);
-      return null;
+      return { summary: '(リアルタイム企業情報の検索中にエラーが発生しました)', sourcesMarkdown: '' };
     }
   }
 
@@ -369,10 +364,7 @@ class SalesCopilot {
     }
     
     if (companyInfoFromSearch) {
-      additionalInfo += `\n--- 企業調査情報（リアルタイム検索） ---\n`;
-      additionalInfo += `- 事業内容: ${companyInfoFromSearch.company_description || '不明'}\n`;
-      additionalInfo += `- 主な製品/サービス: ${companyInfoFromSearch.main_service || '不明'}\n`;
-      additionalInfo += `- 最新のニュース: ${companyInfoFromSearch.last_signal_summary || '不明'}\n`;
+      additionalInfo += `\n--- 企業調査情報（リアルタイム検索） ---\n${companyInfoFromSearch}\n`;
       hasInfo = true;
     }
     
@@ -462,6 +454,7 @@ class SalesCopilot {
         }
       }
     }
+    Logger.log(`❌ ${taskName}のリトライがすべて失敗しました。`);
     throw lastError;
   }
 
