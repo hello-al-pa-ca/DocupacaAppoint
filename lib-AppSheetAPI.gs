@@ -93,6 +93,63 @@ async function example_deleteRecords() {
   }
 }
 
+/**
+ * 【テスト実行用関数】
+ * 指定したテーブルから、特定の条件に一致するレコードを検索します。
+ */
+async function test_findRecord() {
+  // =================================================================
+  // ▼▼▼ 設定項目 ▼▼▼
+  // =================================================================
+  const TABLE_TO_SEARCH = 'Account';         // 検索対象のテーブル名
+  const COLUMN_TO_FILTER = 'enrichment_status';             // 検索条件に使うカラム名
+  const VALUE_TO_FIND = 'Pending'; // 検索する値
+  const EXEC_USER_EMAIL = 'hello@al-pa-ca.com'; // 実行ユーザーのEmail
+  // =================================================================
+
+  Logger.log(`[START] AppSheet Findアクションのテストを開始します。`);
+  Logger.log(`  -> 検索対象テーブル: ${TABLE_TO_SEARCH}`);
+  Logger.log(`  -> 検索条件: [${COLUMN_TO_FILTER}] = "${VALUE_TO_FIND}"`);
+
+  try {
+    const props = PropertiesService.getScriptProperties().getProperties();
+    const appId = props['APPSHEET_APP_ID'];
+    const apiKey = props['APPSHEET_API_KEY'];
+
+    if (!appId || !apiKey) {
+      throw new Error("スクリプトプロパティに'APPSHEET_APP_ID'または'APPSHEET_API_KEY'が設定されていません。");
+    }
+
+    const client = new AppSheetClient(appId, apiKey);
+    
+    // 検索セレクタを構築
+    const selector = `FILTER("${TABLE_TO_SEARCH}", [${COLUMN_TO_FILTER}] = "${VALUE_TO_FIND}")`;
+    const properties = { "Selector": selector };
+    
+    Logger.log(`  -> 実行するセレクタ: ${selector}`);
+
+    // AppSheet APIを呼び出し
+    const result = await client.findData(TABLE_TO_SEARCH, EXEC_USER_EMAIL, properties);
+    
+    Logger.log(`[RESPONSE] AppSheet APIからの応答を受信しました。`);
+
+    if (result && Array.isArray(result) && result.length > 0) {
+      Logger.log(`[SUCCESS] ✅ ${result.length}件のレコードが見つかりました。`);
+      Logger.log(`  -> 最初のレコード: ${JSON.stringify(result[0], null, 2)}`);
+    } else if (result && Array.isArray(result) && result.length === 0) {
+      Logger.log(`[INFO] ⚠️ レコードは見つかりませんでした。API呼び出しは成功しましたが、条件に一致するデータが存在しないようです。`);
+    } else {
+      Logger.log(`[FAIL] ❌ 予期しない応答形式です。`);
+      Logger.log(`  -> 応答内容: ${JSON.stringify(result, null, 2)}`);
+    }
+
+  } catch (e) {
+    Logger.log(`[ERROR] ❌ テスト実行中にエラーが発生しました: ${e.message}`);
+    Logger.log(`  -> スタックトレース: ${e.stack}`);
+  } finally {
+    Logger.log(`[END] テストを終了します。`);
+  }
+}
 
 
 /**
@@ -141,9 +198,9 @@ class APIRequest {
         throw new Error(`API Error: Received status code ${responseCode}. Response: ${responseText}`);
       }
       
-      // レスポンスが空の場合でも成功として扱うことがあるため、空文字列チェックは削除
-      if (responseText === "") {
-        return "Success (No Content)";
+      // ★ v1.2 修正点: 応答が空の場合は、文字列ではなく空の配列を返す
+      if (responseText === "" || responseText === "Success (No Content)") {
+        return [];
       }
 
       // JSONとしてパースを試みる

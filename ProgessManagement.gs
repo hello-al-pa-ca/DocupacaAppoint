@@ -1,33 +1,58 @@
 /**
  * =================================================================
- * 営業進捗ステータス自動更新スクリプト (GAS版) v5
+ * 営業進捗ステータス自動更新スクリプト (GAS版) v6.1
  * =================================================================
- * AppSheetのVirtual Columnの代わりに、GASを使って顧客の営業ステータスを
- * 実カラムに書き込みます。これにより、AppSheetアプリのパフォーマンスを改善します。
+ * ActionFlowシートのカラム名(action_name)とコード内の参照名(action_id)の
+ * 不一致によってステータス更新が失敗していた不具合を修正。
  *
- * 【主な変更点】
- * - 【v5での修正】AppSheet APIライブラリの非同期処理に対応するため、
- * async/awaitを正しく再導入しました。これにより、APIからのデータ取得を
- * 確実に行うようになり、「レコードが見つかりません」エラーを解消します。
- *
- * 【処理の流れ】
- * 1. AppSheetの `SalesAction` テーブルでレコードが追加・更新される。
- * 2. AppSheetのAutomationがこのスクリプトの `updateCustomerStatus` 関数を呼び出す。
- * 3. GASが `SalesAction` レコードから顧客IDを取得し、顧客の `enabled_contact` 列を確認。
- * 4. GASが `SalesActionFlow` のルールを参照して、次のステータスを計算する。
- * 5. GASが顧客テーブル（`BusinessCard`）の `progress_status` 列を更新する。
- *
- * 【AppSheetでの設定方法】
- * (設定方法は以前のバージョンから変更ありません)
+ * 【v6.1での主な変更点】
+ * - `getNextStatus`関数を修正し、ActionFlowシートの`action_name`カラムを
+ * 正しく参照するように変更。
+ * - データ比較時に前後の空白を除去する処理を追加し、より堅牢に。
  * =================================================================
  */
+
+// =================================================================
+// 定数宣言
+// =================================================================
+const PM_CONSTANTS = {
+  TABLE: {
+    SALES_ACTION: 'SalesAction',
+    BUSINESS_CARD: 'BusinessCard',
+    ACTION_FLOW: 'ActionFlow',
+  },
+  COLUMN: {
+    // SalesAction
+    ACTION_ID: 'id',
+    BUSINESS_CARD_ID: 'business_card_id',
+    EXECUTED_DT: 'executed_dt',
+    PROGRESS: 'progress',
+    ACTION_NAME: 'action_name',
+    RESULT: 'result',
+    // BusinessCard
+    CUSTOMER_ID: 'id',
+    ENABLED_CONTACT: 'enabled_contact',
+    PROGRESS_STATUS: 'progress_status',
+    // ActionFlow
+    FLOW_PROGRESS: 'progress',
+    FLOW_ACTION_NAME: 'action_name', // ★ v6.1 修正：カラム名を action_id から action_name に
+    FLOW_RESULT: 'result',
+    FLOW_NEXT_STATUS: 'next_status',
+  },
+  PROPS_KEY: {
+    APPSHEET_APP_ID: 'APPSHEET_APP_ID',
+    APPSHEET_API_KEY: 'APPSHEET_API_KEY',
+    MASTER_SHEET_ID: 'MASTER_SHEET_ID',
+  }
+};
+
 
 /**
  * 【テスト用関数】固定のIDを使ってステータス更新をテストします。
  */
 function test_updateCustomerStatus() {
   // ▼▼▼ テスト用に書き換えてください ▼▼▼
-  const TEST_ACTION_ID = '7FBCF696-7397-49A3-BC8C-7E5E3AB3AAB4'; // テストしたいSalesActionレコードのID
+  const TEST_ACTION_ID = 'YOUR_TEST_SALESACTION_ID'; // テストしたいSalesActionレコードのID
   const TEST_EXEC_USER = 'hello@al-pa-ca.com';       // 実行ユーザーのメールアドレス
   // ▲▲▲
 
@@ -44,56 +69,57 @@ function test_updateCustomerStatus() {
 
 /**
  * 【AppSheetから呼び出す関数】顧客のステータスを更新します。
- * @param {string} actionId - トリガーとなったSalesActionのレコードID。
+ * @param {string} triggerActionId - トリガーとなったSalesActionのレコードID。
  * @param {string} execUserEmail - アクションを実行するユーザーのメールアドレス。
  */
-function updateCustomerStatus(actionId, execUserEmail) {
-  // async/awaitをトップレベルで安全に扱うため、無名関数でラップして実行します。
+function updateCustomerStatus(triggerActionId, execUserEmail) {
   (async () => {
-    if (!actionId || !execUserEmail) {
-      Logger.log("必要な引数（actionId, execUserEmail）が不足しています。");
+    if (!triggerActionId || !execUserEmail) {
+      Logger.log("必要な引数（triggerActionId, execUserEmail）が不足しています。");
       return;
     }
     
     try {
       const statusUpdater = new StatusUpdater(execUserEmail);
       
-      // トリガーとなったアクション情報を取得（awaitで応答を待つ）
-      const latestAction = await statusUpdater.findRecordById('SalesAction', actionId, 'id');
-      if (!latestAction) {
-        throw new Error(`ID [${actionId}] のSalesActionレコードが見つかりません。`);
+      const triggerAction = await statusUpdater.findRecordById(PM_CONSTANTS.TABLE.SALES_ACTION, triggerActionId);
+      if (!triggerAction) {
+        throw new Error(`ID [${triggerActionId}] のSalesActionレコードが見つかりません。`);
       }
 
-      const businessCardId = latestAction.business_card_id; // アクションレコードから親の顧客IDを取得
+      const businessCardId = triggerAction[PM_CONSTANTS.COLUMN.BUSINESS_CARD_ID];
       if(!businessCardId) {
-        throw new Error(`アクション [${actionId}] に顧客ID(business_card_id)が紐付いていません。`);
+        throw new Error(`アクション [${triggerActionId}] に顧客ID(${PM_CONSTANTS.COLUMN.BUSINESS_CARD_ID})が紐付いていません。`);
       }
 
-      // 顧客情報を取得してアプローチ対象か確認（awaitで応答を待つ）
-      const customerRecord = await statusUpdater.findRecordById('BusinessCard', businessCardId, 'id');
+      const customerRecord = await statusUpdater.findRecordById(PM_CONSTANTS.TABLE.BUSINESS_CARD, businessCardId);
       if (!customerRecord) {
         throw new Error(`ID [${businessCardId}] の顧客レコードが見つかりません。`);
       }
 
-      // `enabled_contact`列がFALSEかどうかをチェック
-      const isContactEnabled = (String(customerRecord.enabled_contact).toUpperCase() !== 'FALSE');
-
-      if (!isContactEnabled) {
-        Logger.log(`顧客 [${businessCardId}] はアプローチ対象外(enabled_contact=FALSE)のため、ステータスを「対象外」に更新します。`);
-        await statusUpdater.updateCustomerRecord(businessCardId, { "progress_status": "対象外" });
-        return; // アプローチ対象外ならここで処理を終了
+      if (String(customerRecord[PM_CONSTANTS.COLUMN.ENABLED_CONTACT]).toUpperCase() === 'FALSE') {
+        Logger.log(`顧客 [${businessCardId}] はアプローチ対象外のため、ステータスを「対象外」に更新します。`);
+        await statusUpdater.updateCustomerRecord(businessCardId, { [PM_CONSTANTS.COLUMN.PROGRESS_STATUS]: "対象外" });
+        return;
       }
       
-      const { progress, action_name, result } = latestAction;
+      const latestAction = await statusUpdater.findLatestActionForCustomer(businessCardId);
+      if (!latestAction) {
+        Logger.log(`顧客 [${businessCardId}] に紐づくアクションが見つからないため、処理を終了します。`);
+        return;
+      }
+      Logger.log(`顧客[${businessCardId}]の最新アクションを取得しました (ID: ${latestAction[PM_CONSTANTS.COLUMN.ACTION_ID]})`);
+
+      const { [PM_CONSTANTS.COLUMN.PROGRESS]: progress, [PM_CONSTANTS.COLUMN.ACTION_NAME]: action_name, [PM_CONSTANTS.COLUMN.RESULT]: result } = latestAction;
       
       if (progress === undefined || action_name === undefined) {
-        Logger.log(`エラー：取得したアクションレコードに 'progress' または 'action_name' が含まれていません。AppSheetのテーブル定義を確認してください。`);
+        Logger.log(`エラー：最新のアクションレコードに 'progress' または 'action_name' が含まれていません。`);
         Logger.log(`取得データ: ${JSON.stringify(latestAction)}`);
         return;
       }
       
       if (!result) {
-        Logger.log(`アクション [${actionId}] に結果が設定されていないため、ステータス更新をスキップします。`);
+        Logger.log(`最新アクション [${latestAction[PM_CONSTANTS.COLUMN.ACTION_ID]}] に結果が設定されていないため、ステータス更新をスキップします。`);
         return;
       }
 
@@ -101,7 +127,7 @@ function updateCustomerStatus(actionId, execUserEmail) {
 
       if (nextStatus) {
         Logger.log(`顧客 [${businessCardId}] のステータスを [${nextStatus}] に更新します。`);
-        await statusUpdater.updateCustomerRecord(businessCardId, { "progress_status": nextStatus });
+        await statusUpdater.updateCustomerRecord(businessCardId, { [PM_CONSTANTS.COLUMN.PROGRESS_STATUS]: nextStatus });
       } else {
         Logger.log(`次のステータスが見つかりませんでした。Flowを確認してください。 (progress: ${progress}, action: ${action_name}, result: ${result})`);
       }
@@ -124,19 +150,23 @@ class StatusUpdater {
     }
     this.props = PropertiesService.getScriptProperties().getProperties();
     this.execUserEmail = execUserEmail;
-    this.client = new AppSheetClient(this.props.APPSHEET_APP_ID, this.props.APPSHEET_API_KEY);
-
-    const masterSheetId = this.props.MASTER_SHEET_ID;
-    if (!masterSheetId) throw new Error("マスターシートのIDがスクリプトプロパティに設定されていません。");
     
-    this.salesFlows = this._loadSheetData(masterSheetId, 'ActionFlow');
+    const appId = this.props[PM_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID];
+    const apiKey = this.props[PM_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY];
+    if (!appId || !apiKey) throw new Error("AppSheetのIDまたはAPIキーが設定されていません。");
+    this.client = new AppSheetClient(appId, apiKey);
+
+    const masterSheetId = this.props[PM_CONSTANTS.PROPS_KEY.MASTER_SHEET_ID];
+    if (!masterSheetId) throw new Error("マスターシートのIDが設定されていません。");
+    
+    this.salesFlows = this._loadSheetData(masterSheetId, PM_CONSTANTS.TABLE.ACTION_FLOW);
   }
 
   _loadSheetData(sheetId, sheetName) {
     try {
       const sheet = SpreadsheetApp.openById(sheetId).getSheetByName(sheetName);
       const [headers, ...rows] = sheet.getDataRange().getValues();
-      return rows.map(row => headers.reduce((obj, header, i) => (obj[header] = row[i], obj), {}));
+      return rows.map(row => headers.reduce((obj, header, i) => (obj[String(header).trim()] = String(row[i]).trim(), obj), {}));
     } catch (e) {
       throw new Error(`マスターシート(ID: ${sheetId}, Name: ${sheetName})の読み込みに失敗しました。: ${e.message}`);
     }
@@ -144,38 +174,52 @@ class StatusUpdater {
 
   /**
    * 指定されたテーブルから特定のIDを持つレコードを検索します。
-   * @param {string} tableName - 検索するテーブル名。
-   * @param {string} recordId - 検索するレコードのID。
-   * @param {string} [keyColumn='id'] - 検索に使用するキー列の名前。
-   * @returns {Promise<Object|null>} - 見つかったレコードオブジェクト、またはnull。
    */
-  async findRecordById(tableName, recordId, keyColumn = 'id') {
+  async findRecordById(tableName, recordId) {
+    const keyColumn = (tableName === PM_CONSTANTS.TABLE.BUSINESS_CARD) ? PM_CONSTANTS.COLUMN.CUSTOMER_ID : PM_CONSTANTS.COLUMN.ACTION_ID;
     const selector = `FILTER("${tableName}", [${keyColumn}] = "${recordId}")`;
     const result = await this.client.findData(tableName, this.execUserEmail, { "Selector": selector });
     return (result && result.length > 0) ? result[0] : null;
   }
+  
+  /**
+   * 特定の顧客に紐づく、実行日時が最も新しいSalesActionレコードを取得します。
+   */
+  async findLatestActionForCustomer(businessCardId) {
+    const selector = `FILTER("${PM_CONSTANTS.TABLE.SALES_ACTION}", [${PM_CONSTANTS.COLUMN.BUSINESS_CARD_ID}] = "${businessCardId}")`;
+    const allActions = await this.client.findData(PM_CONSTANTS.TABLE.SALES_ACTION, this.execUserEmail, { "Selector": selector });
 
-  getNextStatus(currentProgress, currentActionName, currentResult) {
-    // SalesActionFlowのaction_id列はアクション名が入っていると仮定
-    const flow = this.salesFlows.find(row =>
-      row.progress === currentProgress &&
-      row.action_id === currentActionName &&
-      row.result === currentResult
-    );
-    return flow ? flow.next_status : null;
+    if (!allActions || allActions.length === 0) {
+      return null;
+    }
+
+    const sortedActions = allActions.sort((a, b) => {
+        const dateA = new Date(a[PM_CONSTANTS.COLUMN.EXECUTED_DT] || 0);
+        const dateB = new Date(b[PM_CONSTANTS.COLUMN.EXECUTED_DT] || 0);
+        return dateB - dateA;
+    });
+
+    return sortedActions[0];
   }
 
   /**
-   * 顧客レコードを更新します。
-   * @param {string} customerId - 更新する顧客のID。
-   * @param {Object} fieldsToUpdate - 更新するフィールドのキーと値。
-   * @returns {Promise<Object>} - APIからのレスポンス。
+   * 次に取るべきステータスを計算します。
+   */
+  getNextStatus(currentProgress, currentActionName, currentResult) {
+    // ★ v6.1 修正点: `action_id` を `action_name` に修正し、trim()で空白を除去
+    const flow = this.salesFlows.find(row =>
+      row[PM_CONSTANTS.COLUMN.FLOW_PROGRESS] === currentProgress &&
+      row[PM_CONSTANTS.COLUMN.FLOW_ACTION_NAME] === currentActionName &&
+      row[PM_CONSTANTS.COLUMN.FLOW_RESULT] === currentResult
+    );
+    return flow ? flow[PM_CONSTANTS.COLUMN.FLOW_NEXT_STATUS] : null;
+  }
+
+  /**
+   * 顧客レコードのステータスを更新します。
    */
   async updateCustomerRecord(customerId, fieldsToUpdate) {
-    const CUSTOMER_TABLE_NAME = 'BusinessCard'; 
-    const CUSTOMER_KEY_COLUMN = 'id';
-
-    const recordData = { [CUSTOMER_KEY_COLUMN]: customerId, ...fieldsToUpdate };
-    return await this.client.updateRecords(CUSTOMER_TABLE_NAME, [recordData], this.execUserEmail);
+    const recordData = { [PM_CONSTANTS.COLUMN.CUSTOMER_ID]: customerId, ...fieldsToUpdate };
+    return await this.client.updateRecords(PM_CONSTANTS.TABLE.BUSINESS_CARD, [recordData], this.execUserEmail);
   }
 }

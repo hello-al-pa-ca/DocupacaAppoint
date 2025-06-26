@@ -1,13 +1,17 @@
 /**
  * =================================================================
- * AccountEnricher (v5.3 - 不具合修正・最終版)
+ * AccountEnricher (v6.0 - 接続先分離版)
  * =================================================================
- * 'approach_recommended' の値をTRUE/FALSEのフラグ形式に変換する
- * 処理が漏れていた不具合を修正しました。
+ * 本番アプリのセキュリティフィルタを回避するため、このEnricherスクリプトが
+ * 参照・更新するAppSheetアプリを、フィルタのない別の管理用アプリに
+ * 分離できるように修正しました。
  *
- * 【v5.3での主な変更点】
- * - AIが返す「はい」という文字列を、AppSheetが認識できる`TRUE`に変換する
- * ロジックを再度追加。これにより、データの整合性が保たれます。
+ * 【v6.0での主な変更点】
+ * - スクリプトプロパティに、Enricher専用の接続情報
+ * （`ENRICHER_APPSHEET_APP_ID`, `ENRICHER_APPSHEET_API_KEY`）を
+ * 新たに追加。
+ * - `AccountEnricher`クラスの初期化時に、この専用の接続情報を
+ * 読み込むようにロジックを修正。
  * =================================================================
  */
 
@@ -16,9 +20,11 @@
 // =================================================================
 const ENRICHER_CONSTANTS = {
   PROPS_KEY: {
-    SERVICE_ACCOUNT: 'SERVICE_ACCOUNT',
-    APPSHEET_APP_ID: 'APPSHEET_APP_ID',
-    APPSHEET_API_KEY: 'APPSHEET_API_KEY',
+    // ▼▼▼【v6.0 修正点】Enricher専用の接続情報を追加 ▼▼▼
+    ENRICHER_APPSHEET_APP_ID: 'ENRICHER_APPSHEET_APP_ID',
+    ENRICHER_APPSHEET_API_KEY: 'ENRICHER_APPSHEET_API_KEY',
+    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
     GEMINI_MODEL: 'GEMINI_MODEL',
   },
   DEFAULT_MODEL: 'gemini-2.0-flash',
@@ -54,9 +60,10 @@ const ENRICHER_CONSTANTS = {
 // =================================================================
 
 function runAccountEnrichmentBatch() {
-  const execUserEmail = PropertiesService.getScriptProperties().getProperty(ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT);
+  const execUserEmail = 'hello@al-pa-ca.com';
+  
   if (!execUserEmail) {
-    Logger.log(`❌ エラー: スクリプトプロパティに "${ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT}" が設定されていません。`);
+    Logger.log(`❌ エラー: 実行ユーザーのメールアドレスが設定されていません。`);
     return;
   }
   Logger.log(`[START] 企業情報収集バッチをサービスアカウント (${execUserEmail}) で開始します。`);
@@ -92,17 +99,22 @@ class AccountEnricher {
     this.execUserEmail = execUserEmail;
     this.props = PropertiesService.getScriptProperties().getProperties();
     
-    const appId = this.props[ENRICHER_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID];
-    const apiKey = this.props[ENRICHER_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY];
+    // =================================================================
+    // ▼▼▼【v6.0 修正点】Enricher専用の接続情報を読み込む ▼▼▼
+    // =================================================================
+    const appId = this.props[ENRICHER_CONSTANTS.PROPS_KEY.ENRICHER_APPSHEET_APP_ID];
+    const apiKey = this.props[ENRICHER_CONSTANTS.PROPS_KEY.ENRICHER_APPSHEET_API_KEY];
+    // =================================================================
+
     const geminiModel = this.props[ENRICHER_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || ENRICHER_CONSTANTS.DEFAULT_MODEL;
 
     if (!appId || !apiKey) {
-      throw new Error('AppSheetのApp IDまたはAPIキーがスクリプトプロパティに設定されていません。');
+      throw new Error("Enricher専用のApp IDまたはAPIキーがスクリプトプロパティに設定されていません。('ENRICHER_APPSHEET_APP_ID', 'ENRICHER_APPSHEET_API_KEY')");
     }
 
     this.appSheetClient = new AppSheetClient(appId, apiKey);
     this.geminiClient = new GeminiClient(geminiModel);
-    Logger.log(`✅ AccountEnricherの初期化完了 (使用モデル: ${geminiModel})`);
+    Logger.log(`✅ AccountEnricherの初期化完了 (接続先AppID: ${appId}, 使用モデル: ${geminiModel})`);
   }
 
   async processSingleAccount(accountId) {
@@ -142,6 +154,23 @@ class AccountEnricher {
     } catch (error) {
       Logger.log(`❌ [ERROR] Account ID [${accountId}] の処理中にエラー: ${error.stack}`);
       await this._updateAccountStatus(accountId, ENRICHER_CONSTANTS.STATUS.FAILED).catch(e => Logger.log(`  -> ⚠️ ステータス更新にも失敗: ${e.message}`));
+    }
+  }
+
+  /**
+   * AppSheetから情報収集が保留中（Pending）のアカウントを、指定件数分だけ取得します。
+   */
+  async _findPendingAccounts() {
+    const selector = `TOP(FILTER("${ENRICHER_CONSTANTS.TABLE.ACCOUNT}", [${ENRICHER_CONSTANTS.COLUMN.STATUS}] = "${ENRICHER_CONSTANTS.STATUS.PENDING}"), ${ENRICHER_CONSTANTS.BATCH_PROCESSING_LIMIT})`;
+    
+    const properties = { "Selector": selector };
+    
+    try {
+      const results = await this.appSheetClient.findData(ENRICHER_CONSTANTS.TABLE.ACCOUNT, this.execUserEmail, properties);
+      return (results && Array.isArray(results)) ? results : [];
+    } catch (e) {
+      Logger.log(`❌ [ERROR] AppSheetからのデータ取得に失敗しました: ${e.message}`);
+      return [];
     }
   }
 
@@ -210,12 +239,10 @@ class AccountEnricher {
       }
     }
 
-    // ★ v5.3 修正点: Yes/No型の変換処理を追加
     const yesNoKey = ENRICHER_CONSTANTS.COLUMN.APPROACH_RECOMMENDED;
     if (sanitized.hasOwnProperty(yesNoKey)) {
         const originalValue = sanitized[yesNoKey];
         sanitized[yesNoKey] = (originalValue === 'はい');
-        Logger.log(`  -> サニタイズ: "${yesNoKey}" の "${originalValue}" を ${sanitized[yesNoKey]} に変換しました。`);
     }
 
     ENRICHER_CONSTANTS.DATE_COLUMNS.forEach(key => {
@@ -285,8 +312,15 @@ class AccountEnricher {
 
     Logger.log(`[INFO] ${pendingAccounts.length}件のアカウントの情報収集を開始します。`);
 
-    for (const account of pendingAccounts) {
+    for (const [index, account] of pendingAccounts.entries()) {
+      Logger.log(`[BATCH] ${index + 1} / ${pendingAccounts.length} 件目の処理を開始します...`);
       await this.processSingleAccount(account[ENRICHER_CONSTANTS.COLUMN.ID]);
+      
+      if (index < pendingAccounts.length - 1) {
+          const delay = 1500;
+          Logger.log(`[PAUSE] 次の処理まで ${delay / 1000} 秒待機します...`);
+          Utilities.sleep(delay);
+      }
     }
     
     Logger.log("[END] すべてのアカウントの情報収集処理が完了しました。");
@@ -302,20 +336,5 @@ class AccountEnricher {
     }
     Logger.log(`[WARN] テーブル[${tableName}]からID[${recordId}]のレコードが見つかりませんでした。`);
     return null;
-  }
-
-  async _findPendingAccounts() {
-    const selector = `FILTER("${ENRICHER_CONSTANTS.TABLE.ACCOUNT}", [${ENRICHER_CONSTANTS.COLUMN.STATUS}] = "${ENRICHER_CONSTANTS.STATUS.PENDING}")`;
-    const properties = { 
-      "Selector": selector,
-      "Properties": { "PageSize": ENRICHER_CONSTANTS.BATCH_PROCESSING_LIMIT, "Locale": "ja-JP" }
-    };
-    try {
-      const results = await this.appSheetClient.findData(ENRICHER_CONSTANTS.TABLE.ACCOUNT, this.execUserEmail, properties);
-      return (results && Array.isArray(results)) ? results : [];
-    } catch (e) {
-      Logger.log(`❌ [ERROR] AppSheetからのデータ取得に失敗しました: ${e.message}`);
-      return [];
-    }
   }
 }

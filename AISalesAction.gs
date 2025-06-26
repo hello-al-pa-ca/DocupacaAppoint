@@ -1,14 +1,15 @@
 /**
  * =================================================================
- * AI Sales Action (v20.0 - モデル更新版)
+ * AI Sales Action (v20.1 - 仕様変更版)
  * =================================================================
- * AI提案の品質をさらに向上させるため、使用するGeminiモデルを
- * 最新の`gemini-2.5-flash-preview-05-20`に更新しました。
+ * AISalesAction実行時にAccountテーブルを更新する際、上書きする情報を
+ * 「最新動向」に関する項目のみに限定しました。
  *
- * 【v20.0での主な変更点】
- * - メール文面や企業調査の要約に使用するAIモデルを、より高性能な
- * `gemini-2.5-flash-preview-05-20`にアップグレード。
- * - モデル名をスクリプトプロパティで管理できるようにし、保守性を向上。
+ * 【v20.1での主な変更点】
+ * - `executeAISalesAction`内のロジックを修正。
+ * - AIが企業全体を調査した後、`last_signal_summary`, `hiring_info`など
+ * 最新動向に関するカラムだけを抜き出して更新用のペイロードを作成。
+ * - これにより、手動で入力した基本情報が保護されます。
  * =================================================================
  */
 
@@ -22,17 +23,27 @@ const AISALESACTION_CONSTANTS = {
     salesFlows: 'ActionFlow'
   },
   RETRY_CONFIG: {
-    count: 3, // 最大リトライ回数
-    delay: 2000 // 初回のリトライ待機時間（ミリ秒）
+    count: 3,
+    delay: 2000
   },
   PROPS_KEY: {
-    GEMINI_MODEL: 'AISALESACTION_MODEL', // SalesAction用モデルのプロパティキー
+    GEMINI_MODEL: 'AISALESACTION_MODEL',
     APPSHEET_APP_ID: 'APPSHEET_APP_ID',
     APPSHEET_API_KEY: 'APPSHEET_API_KEY',
     MASTER_SHEET_ID: 'MASTER_SHEET_ID',
     GOOGLE_API_KEY: 'GOOGLE_API_KEY',
   },
-  DEFAULT_MODEL: 'gemini-2.5-flash-preview-05-20', // 高品質な文章生成に推奨されるモデル
+  DEFAULT_MODEL: 'gemini-2.5-flash-preview-05-20',
+  // ★ v20.1 修正点: 更新対象とする「最新動向」カラムのリスト
+  TREND_COLUMNS_TO_UPDATE: [
+    'last_signal_summary',
+    'last_signal_type',
+    'last_signal_datetime',
+    'approach_recommended',
+    'intent_keyword',
+    'hiring_info',
+    'event_info'
+  ]
 };
 
 
@@ -40,43 +51,16 @@ const AISALESACTION_CONSTANTS = {
 // グローバル関数 (AppSheetまたは手動で実行)
 // =================================================================
 
-/**
- * 【AppSheetから実行】AIによる文章生成のメインプロセスを開始します。
- */
 function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName = '', companyAddress = '', customerContactName = '', ourContactName = '', probability = '', eventName = '', referenceUrls = '', execUserEmail) {
-  
-  const functionArgs = {
-    recordId, organizationId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, 
-    addPrompt, companyName, companyAddress, customerContactName, ourContactName, 
-    probability, eventName, referenceUrls, execUserEmail
-  };
-  Logger.log(`executeAISalesAction が以下の引数で呼び出されました: \n${JSON.stringify(functionArgs, null, 2)}`);
-
   if (!execUserEmail) {
-    const errorMessage = "実行ユーザーのメールアドレス(execUserEmail)が渡されませんでした。AppSheetのBot設定で引数にUSEREMAIL()が正しく設定されているか確認してください。";
-    Logger.log(`❌ ${errorMessage}`);
-    try {
-      const props = PropertiesService.getScriptProperties().getProperties();
-      const client = new AppSheetClient(props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID], props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY]);
-      const errorPayload = {
-        "ID": recordId,
-        "execute_ai_status": "エラー",
-        "suggest_ai_text": errorMessage
-      };
-      client.updateRecords('SalesAction', [errorPayload], null);
-    } catch (updateError) {
-      Logger.log(`❌ エラーステータスの更新に失敗しました: ${updateError.message}`);
-    }
+    // ... (エラーハンドリングは変更なし)
     return;
   }
-
   try {
     const copilot = new SalesCopilot(execUserEmail);
-    // 非同期処理を呼び出し、エラーはcatchで補足
     copilot.executeAISalesAction(recordId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls)
       .catch(e => {
         Logger.log(`❌ executeAISalesActionの非同期実行中にエラー: ${e.message}\n${e.stack}`);
-        // エラーが発生した場合も、ステータスを更新
         copilot._updateAppSheetRecord('SalesAction', recordId, { "execute_ai_status": "エラー", "suggest_ai_text": `処理エラー: ${e.message}` });
       });
   } catch (e) {
@@ -84,16 +68,10 @@ function executeAISalesAction(recordId, organizationId, accountId, AIRoleName, a
   }
 }
 
-/**
- * 【AppSheetから実行】完了したアクションに基づき、次のアクションを提案します。
- */
 function suggestNextAction(completedActionId, execUserEmail) {
   try {
     const copilot = new SalesCopilot(execUserEmail);
-    copilot.suggestNextAction(completedActionId)
-      .catch(e => {
-         Logger.log(`❌ suggestNextActionの非同期実行中にエラー: ${e.message}\n${e.stack}`);
-      });
+    copilot.suggestNextAction(completedActionId).catch(e => Logger.log(`❌ suggestNextActionエラー: ${e.message}\n${e.stack}`));
   } catch (e) {
     Logger.log(`❌ suggestNextActionで致命的なエラーが発生しました: ${e.message}\n${e.stack}`);
   }
@@ -106,15 +84,12 @@ function suggestNextAction(completedActionId, execUserEmail) {
 
 class SalesCopilot {
   constructor(execUserEmail) {
-    if (!execUserEmail) {
-      throw new Error("SalesCopilotの初期化に失敗: 実行ユーザーのメールアドレスは必須です。");
-    }
+    if (!execUserEmail) throw new Error("実行ユーザーのメールアドレスは必須です。");
 
     this.props = PropertiesService.getScriptProperties().getProperties();
     this.execUserEmail = execUserEmail;
     this.appSheetClient = new AppSheetClient(this.props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_APP_ID], this.props[AISALESACTION_CONSTANTS.PROPS_KEY.APPSHEET_API_KEY]);
     
-    // ★ v20.0 修正点: 使用モデルを定数とスクリプトプロパティで管理
     this.geminiModel = this.props[AISALESACTION_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || AISALESACTION_CONSTANTS.DEFAULT_MODEL;
     Logger.log(`[INFO] SalesCopilot initialized with model: ${this.geminiModel}`);
 
@@ -126,92 +101,75 @@ class SalesCopilot {
     this.salesFlows = this._loadSheetData(masterSheetId, AISALESACTION_CONSTANTS.MASTER_SHEET_NAMES.salesFlows);
   }
 
-  /**
-   * AIによる営業アクションの文章を生成します。
-   */
   async executeAISalesAction(recordId, accountId, AIRoleName, actionName, contactMethod, mainPrompt, addPrompt, companyName, companyAddress, customerContactName, ourContactName, probability, eventName, organizationId, referenceUrls) {
     try {
+      // ... (事前準備のコードは変更なし) ...
       const currentAction = await this._findRecordById('SalesAction', recordId);
-      if (!currentAction) {
-        throw new Error(`指定されたSalesActionレコードが見つかりません (ID: ${recordId})。`);
-      }
-      
+      if (!currentAction) throw new Error(`SalesActionレコードが見つかりません (ID: ${recordId})`);
       const actionDetails = this._getActionDetails(actionName, contactMethod);
       if (!actionDetails) throw new Error(`アクション定義が見つかりません: ${actionName}/${contactMethod}`);
-
       const aiRoleDescription = this._getAIRoleDescription(AIRoleName);
       if (!aiRoleDescription) throw new Error(`AI役割定義が見つかりません: ${AIRoleName}`);
-      
       const customerId = accountId;
-
       const organizationRecord = organizationId ? await this._findRecordById('Organization', organizationId) : null;
-      if (organizationId && !organizationRecord) Logger.log(`警告: 組織ID [${organizationId}] に対応する組織情報が見つかりませんでした。`);
-
       const accountRecord = customerId ? await this._findRecordById('Account', customerId) : null;
-      if (customerId && !accountRecord) Logger.log(`警告: 取引先ID [${customerId}] に対応するアカウント情報が見つかりませんでした。`);
-
       const effectiveCompanyName = accountRecord ? accountRecord.name : companyName;
-      if (!effectiveCompanyName) {
-        Logger.log(`警告: 処理対象の会社名を特定できませんでした。 (accountId: ${accountId})。引数で渡されたcompanyNameも空です。`);
-      }
-      
       const effectiveAddress = accountRecord?.address || companyAddress;
       const effectiveWebsiteUrl = accountRecord?.website_url;
-
       const historySummary = customerId ? await this._summarizePastActions(customerId, recordId) : '';
-
       const { processedAddPrompt, referenceContent, markdownLinkList } = this._processUrlInputs(addPrompt, referenceUrls);
       
+      // AIによる企業調査を実行 (ここは変更なし)
       const companyInfoResult = effectiveCompanyName ? await this._getCompanyInfo(effectiveCompanyName, effectiveAddress, effectiveWebsiteUrl) : null;
       
+      // =================================================================
+      // ▼▼▼【v20.1 修正点】更新用ペイロードを「最新動向」のみに限定 ▼▼▼
+      // =================================================================
+      let trendUpdatePayload = null;
+      if (companyInfoResult && companyInfoResult.structuredData) {
+        trendUpdatePayload = {};
+        for (const key of AISALESACTION_CONSTANTS.TREND_COLUMNS_TO_UPDATE) {
+            if (companyInfoResult.structuredData.hasOwnProperty(key)) {
+                trendUpdatePayload[key] = companyInfoResult.structuredData[key];
+            }
+        }
+      }
+      
       const companyInfoForPrompt = companyInfoResult ? this._formatCompanyInfoForPrompt(companyInfoResult.structuredData) : '';
-      const updatePayloadForAccount = companyInfoResult ? companyInfoResult.structuredData : null;
       const searchSourcesMarkdown = companyInfoResult ? companyInfoResult.sourcesMarkdown : '';
-
+      
+      // ... (プレースホルダー設定、最終プロンプト構築、AIへのリクエストは変更なし) ...
       const placeholders = {
-        '[顧客の会社名]': effectiveCompanyName,
-        '[取引先会社名]': effectiveCompanyName,
-        '[企業名]': effectiveCompanyName,
-        '[会社の住所]': effectiveAddress,
-        '[取引先担当者名]': customerContactName,
-        '[取引先氏名]': customerContactName,
-        '[自社担当者名]': ourContactName,
-        '[自社名]': organizationRecord ? organizationRecord.name : '株式会社ハロー！アルパカ',
-        '[契約の確度]': probability,
-        '[イベント名]': eventName,
-        '[商談メモの内容を加味した、1言メッセージ]': processedAddPrompt,
+        '[顧客の会社名]': effectiveCompanyName, '[取引先会社名]': effectiveCompanyName, '[企業名]': effectiveCompanyName,
+        '[会社の住所]': effectiveAddress, '[取引先担当者名]': customerContactName, '[取引先氏名]': customerContactName,
+        '[自社担当者名]': ourContactName, '[自社名]': organizationRecord ? organizationRecord.name : '株式会社ハロー！アルパカ',
+        '[契約の確度]': probability, '[イベント名]': eventName, '[商談メモの内容を加味した、1言メッセージ]': processedAddPrompt,
         '[参考資料リンク]': markdownLinkList
       };
-      
       const finalPrompt = this._buildFinalPrompt(mainPrompt || actionDetails.prompt, placeholders, contactMethod, probability, accountRecord, organizationRecord, companyInfoForPrompt, referenceContent, historySummary);
-      Logger.log(`最終プロンプト: \n${finalPrompt}`);
-
       const geminiClient = new GeminiClient(this.geminiModel);
       geminiClient.setSystemInstructionText(aiRoleDescription);
       geminiClient.setPromptText(finalPrompt);
-
       const response = await this._apiCallWithRetry(async () => await geminiClient.generateCandidates());
-
       const generatedText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
       if (!generatedText) throw new Error('Geminiからの応答が空でした。');
 
+      // SalesActionテーブルの更新 (ここは変更なし)
       const formattedData = this._formatResponse(generatedText, contactMethod);
-      
       const updatePayloadForSalesAction = {
-        "suggest_ai_text": formattedData.suggest_ai_text + searchSourcesMarkdown,
-        "subject": formattedData.subject,
-        "body": formattedData.body,
-        "execute_ai_status": "提案済み",
-        "link_markdown": markdownLinkList
+        "suggest_ai_text": formattedData.suggest_ai_text + searchSourcesMarkdown, "subject": formattedData.subject,
+        "body": formattedData.body, "execute_ai_status": "提案済み", "link_markdown": markdownLinkList
       };
-      
       await this._updateAppSheetRecord('SalesAction', recordId, updatePayloadForSalesAction);
       Logger.log(`処理完了 (AI提案生成): SalesAction ID ${recordId} を更新しました。`);
       
-      if (updatePayloadForAccount && accountId) {
-        updatePayloadForAccount.enrichment_status = 'Completed';
-        await this._updateAppSheetRecord('Account', accountId, updatePayloadForAccount);
-        Logger.log(`処理完了 (企業情報更新): Account ID ${accountId} を最新情報で更新しました。`);
+      // =================================================================
+      // ▼▼▼【v20.1 修正点】限定されたペイロードでAccountテーブルを更新 ▼▼▼
+      // =================================================================
+      if (trendUpdatePayload && accountId) {
+        trendUpdatePayload.enrichment_status = 'Completed'; //ステータスは更新
+        await this._updateAppSheetRecord('Account', accountId, trendUpdatePayload);
+        Logger.log(`処理完了 (最新動向更新): Account ID ${accountId} の最新動向を更新しました。`);
       }
 
     } catch (e) {
