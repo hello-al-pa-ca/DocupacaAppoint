@@ -356,7 +356,7 @@ class SalesCopilot {
     }
     filledTemplate = filledTemplate.replace(/\[[^\]]+\]/g, ''); 
 
-    let additionalInfo = '\n\n【補足情報】\nこの情報を最大限に活用し、下記の指示に従って、具体的でパーソナライズされた文章を作成してください。\n';
+    let additionalInfo = '\n\n【補足情報】\nこの情報を最大限に活用し、下記の指示に従って、パーソナライズされた文章を作成してください。\n';
     let hasInfo = false;
     
     if (organizationRecord) {
