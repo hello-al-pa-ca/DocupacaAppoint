@@ -1,17 +1,15 @@
 /**
  * =================================================================
- * AccountEnricher (v6.0 - 接続先分離版)
+ * AccountEnricher (v6.7 - ハルシネーション対策版)
  * =================================================================
- * 本番アプリのセキュリティフィルタを回避するため、このEnricherスクリプトが
- * 参照・更新するAppSheetアプリを、フィルタのない別の管理用アプリに
- * 分離できるように修正しました。
+ * v6.6をベースに、AIが事実に基づかない情報を生成する「ハルシネーション」を
+ * 抑制するための修正を加えました。
  *
- * 【v6.0での主な変更点】
- * - スクリプトプロパティに、Enricher専用の接続情報
- * （`ENRICHER_APPSHEET_APP_ID`, `ENRICHER_APPSHEET_API_KEY`）を
- * 新たに追加。
- * - `AccountEnricher`クラスの初期化時に、この専用の接続情報を
- * 読み込むようにロジックを修正。
+ * 【v6.7での主な変更点】
+ * - _enrichWithAI()内のプロンプトを修正。
+ * - 「検索ツールが提供する情報のみを基に回答すること」
+ * 「推測に基づく情報を含めないこと」という厳格なルールを追加。
+ * - これにより、生成される情報の事実性が向上します。
  * =================================================================
  */
 
@@ -20,11 +18,9 @@
 // =================================================================
 const ENRICHER_CONSTANTS = {
   PROPS_KEY: {
-    // ▼▼▼【v6.0 修正点】Enricher専用の接続情報を追加 ▼▼▼
     ENRICHER_APPSHEET_APP_ID: 'ENRICHER_APPSHEET_APP_ID',
     ENRICHER_APPSHEET_API_KEY: 'ENRICHER_APPSHEET_API_KEY',
-    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-
+    SERVICE_ACCOUNT: 'SERVICE_ACCOUNT',
     GEMINI_MODEL: 'GEMINI_MODEL',
   },
   DEFAULT_MODEL: 'gemini-2.0-flash',
@@ -52,6 +48,7 @@ const ENRICHER_CONSTANTS = {
     SKIPPED: 'Skipped',
   },
   BATCH_PROCESSING_LIMIT: 10,
+  TRIGGER_FUNCTION_NAME: 'runAccountEnrichmentBatch' // トリガーで呼び出す関数名
 };
 
 
@@ -59,17 +56,41 @@ const ENRICHER_CONSTANTS = {
 // グローバル関数 (トリガーまたは手動で実行)
 // =================================================================
 
+/**
+ * 企業情報収集バッチのメイン関数。
+ * 手動または時間主導型トリガーで実行します。
+ * 処理が残っている場合、1分後に自分自身を呼び出すトリガーをセットします。
+ */
 function runAccountEnrichmentBatch() {
-  const execUserEmail = 'hello@al-pa-ca.com';
+  _deleteTriggersByName(ENRICHER_CONSTANTS.TRIGGER_FUNCTION_NAME);
+
+  const execUserEmail = PropertiesService.getScriptProperties().getProperty(ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT);
   
   if (!execUserEmail) {
-    Logger.log(`❌ エラー: 実行ユーザーのメールアドレスが設定されていません。`);
+    Logger.log(`❌ エラー: 実行ユーザーのメールアドレスが設定されていません。スクリプトプロパティ '${ENRICHER_CONSTANTS.PROPS_KEY.SERVICE_ACCOUNT}' を確認してください。`);
     return;
   }
   Logger.log(`[START] 企業情報収集バッチをサービスアカウント (${execUserEmail}) で開始します。`);
+  
   try {
     const enricher = new AccountEnricher(execUserEmail);
-    enricher.enrichAllPendingAccounts().catch(e => Logger.log(`❌ バッチ処理エラー: ${e.message}\n${e.stack}`));
+    enricher.enrichAllPendingAccounts().then(() => {
+      Logger.log("1バッチ分の処理が完了しました。残りの処理があるか確認します...");
+      const remainingAccounts = enricher._findPendingAccounts();
+      remainingAccounts.then(accounts => {
+        if (accounts && accounts.length > 0) {
+          Logger.log(`[CONTINUE] 未処理のレコードが${accounts.length}件残っています。1分後に次のバッチ処理を予約します。`);
+          ScriptApp.newTrigger(ENRICHER_CONSTANTS.TRIGGER_FUNCTION_NAME)
+            .timeBased()
+            .after(1 * 60 * 1000) // 1分後
+            .create();
+        } else {
+          Logger.log(`[COMPLETE] ✅ すべてのレコードの処理が完了しました。バッチ処理を終了します。`);
+        }
+      });
+    }).catch(e => {
+      Logger.log(`❌ バッチ処理の実行中にエラーが発生しました: ${e.message}\n${e.stack}`);
+    });
   } catch (e) {
     Logger.log(`❌ 初期化エラー: ${e.message}\n${e.stack}`);
   }
@@ -99,22 +120,15 @@ class AccountEnricher {
     this.execUserEmail = execUserEmail;
     this.props = PropertiesService.getScriptProperties().getProperties();
     
-    // =================================================================
-    // ▼▼▼【v6.0 修正点】Enricher専用の接続情報を読み込む ▼▼▼
-    // =================================================================
     const appId = this.props[ENRICHER_CONSTANTS.PROPS_KEY.ENRICHER_APPSHEET_APP_ID];
     const apiKey = this.props[ENRICHER_CONSTANTS.PROPS_KEY.ENRICHER_APPSHEET_API_KEY];
-    // =================================================================
-
-    const geminiModel = this.props[ENRICHER_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || ENRICHER_CONSTANTS.DEFAULT_MODEL;
-
+    
     if (!appId || !apiKey) {
       throw new Error("Enricher専用のApp IDまたはAPIキーがスクリプトプロパティに設定されていません。('ENRICHER_APPSHEET_APP_ID', 'ENRICHER_APPSHEET_API_KEY')");
     }
 
     this.appSheetClient = new AppSheetClient(appId, apiKey);
-    this.geminiClient = new GeminiClient(geminiModel);
-    Logger.log(`✅ AccountEnricherの初期化完了 (接続先AppID: ${appId}, 使用モデル: ${geminiModel})`);
+    Logger.log(`✅ AccountEnricherの初期化完了 (接続先AppID: ${appId})`);
   }
 
   async processSingleAccount(accountId) {
@@ -143,6 +157,7 @@ class AccountEnricher {
         Logger.log(`  -> ✅ 整形完了。`);
 
         Logger.log(`[4/4] AppSheetのレコードを更新中...`);
+        
         sanitizedData[ENRICHER_CONSTANTS.COLUMN.STATUS] = ENRICHER_CONSTANTS.STATUS.COMPLETED;
         await this._updateAccountInAppSheet(accountId, sanitizedData);
         Logger.log(`[SUCCESS] ✅ Account ID [${accountId}] の情報更新が正常に完了しました。`);
@@ -157,9 +172,6 @@ class AccountEnricher {
     }
   }
 
-  /**
-   * AppSheetから情報収集が保留中（Pending）のアカウントを、指定件数分だけ取得します。
-   */
   async _findPendingAccounts() {
     const selector = `TOP(FILTER("${ENRICHER_CONSTANTS.TABLE.ACCOUNT}", [${ENRICHER_CONSTANTS.COLUMN.STATUS}] = "${ENRICHER_CONSTANTS.STATUS.PENDING}"), ${ENRICHER_CONSTANTS.BATCH_PROCESSING_LIMIT})`;
     
@@ -170,11 +182,12 @@ class AccountEnricher {
       return (results && Array.isArray(results)) ? results : [];
     } catch (e) {
       Logger.log(`❌ [ERROR] AppSheetからのデータ取得に失敗しました: ${e.message}`);
-      return [];
+      throw e;
     }
   }
 
   async _enrichWithAI(companyName, address, websiteUrl) {
+    // ★★★ 修正点: ハルシネーションを抑制するルールを追加 ★★★
     const prompt = `
       あなたはプロの企業調査アナリストです。
       以下の企業について、公開情報から徹底的に調査し、指定されたJSON形式で回答してください。
@@ -186,6 +199,7 @@ class AccountEnricher {
       - URLヒント: ${websiteUrl || '不明'}
 
       # 収集項目とルール
+      - 【最重要ルール】: 必ずGoogle検索ツールが提供する情報のみを基に回答してください。検索結果に存在しない情報や、推測に基づく情報を回答に含めることは固く禁じます。情報が見つからない場合は、その項目には必ず null を設定してください。
       - 【言語ルール】: すべての回答は、必ず自然で流暢な日本語で記述してください。英語、ロシア語(例: основ)、韓国語(例: 다양한)など、日本語以外の言語や不自然な記号を絶対に混ぜないでください。
       - 【欠損データ】: 見つからない情報は null を返してください。
       - 【日付形式】: 日付に関する項目は「YYYY-MM-DD」形式で回答してください。
@@ -206,25 +220,39 @@ class AccountEnricher {
       }
       
       # 最終確認
-      生成したJSONの各値が、上記のルール（特に言語ルール）に従っていることを必ず確認してください。`;
+      生成したJSONの各値が、上記のルール（特に最重要ルール）に従っていることを必ず確認してください。`;
 
+    let responseText = '';
     try {
-      this.geminiClient.enableGoogleSearchTool();
-      this.geminiClient.setPromptText(prompt);
-      const response = await this.geminiClient.generateCandidates();
-      const responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      const geminiModel = this.props[ENRICHER_CONSTANTS.PROPS_KEY.GEMINI_MODEL] || ENRICHER_CONSTANTS.DEFAULT_MODEL;
+      const localGeminiClient = new GeminiClient(geminiModel);
       
-      const firstBrace = responseText.indexOf('{');
-      const lastBrace = responseText.lastIndexOf('}');
-      if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
-        throw new Error("AIの応答から有効なJSONオブジェクトを抽出できませんでした。");
+      localGeminiClient.enableGoogleSearchTool();
+      localGeminiClient.setPromptText(prompt);
+      const response = await localGeminiClient.generateCandidates();
+      responseText = (response.candidates[0].content.parts || []).map(p => p.text).join('');
+      
+      let jsonString = '';
+      const jsonRegex = /```(json)?\s*([\s\S]*?)\s*```/;
+      const match = responseText.match(jsonRegex);
+
+      if (match && match[2]) {
+        jsonString = match[2];
+      } else {
+        const firstBrace = responseText.indexOf('{');
+        const lastBrace = responseText.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+          jsonString = responseText.substring(firstBrace, lastBrace + 1);
+        } else {
+            throw new Error("AIの応答から有効なJSONオブジェクトを抽出できませんでした。");
+        }
       }
-      const jsonString = responseText.substring(firstBrace, lastBrace + 1);
       
       return JSON.parse(jsonString);
 
     } catch (error) {
       Logger.log(`❌ [ERROR] Geminiでの情報収集またはJSONパース中にエラー: ${error.stack}`);
+      Logger.log(`  -> AIからの生の応答テキスト: \n${responseText}`);
       return null;
     }
   }
@@ -232,7 +260,7 @@ class AccountEnricher {
   _sanitizeDataForAppSheet(data) {
     const sanitized = {};
     for (const key in data) {
-      if (data[key] === '不明') {
+      if (data[key] === '不明' || data[key] === null) {
         sanitized[key] = null;
       } else {
         sanitized[key] = data[key];
@@ -273,14 +301,20 @@ class AccountEnricher {
   
   _formatDateString(dateString) {
       if (!dateString || typeof dateString !== 'string') return null;
+      
       const ymdMatch = dateString.match(/(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?/);
       if (ymdMatch) {
           const year = ymdMatch[1];
           const month = ymdMatch[2].padStart(2, '0');
           const day = ymdMatch[3].padStart(2, '0');
-          return `${year}/${month}/${day}`;
+          const d = new Date(`${year}-${month}-${day}`);
+          if (!isNaN(d.getTime())) {
+            return `${year}/${month}/${day}`;
+          }
       }
-      return dateString;
+      
+      Logger.log(`[WARN] 無効な日付形式の値のため、nullに変換します: "${dateString}"`);
+      return null;
   }
 
   async _updateAccountInAppSheet(accountId, data) {
@@ -303,27 +337,32 @@ class AccountEnricher {
 
   async enrichAllPendingAccounts() {
     Logger.log("⏳ 保留中のアカウントを検索中...");
-    const pendingAccounts = await this._findPendingAccounts();
+    try {
+        const pendingAccounts = await this._findPendingAccounts();
 
-    if (!pendingAccounts || pendingAccounts.length === 0) {
-      Logger.log("✅ 情報収集対象のアカウントはありませんでした。");
-      return;
+        if (!pendingAccounts || pendingAccounts.length === 0) {
+            Logger.log("✅ 今回のバッチで処理するアカウントはありませんでした。");
+            return;
+        }
+
+        Logger.log(`[INFO] ${pendingAccounts.length}件のアカウントの情報収集を開始します。`);
+
+        for (const [index, account] of pendingAccounts.entries()) {
+            Logger.log(`[BATCH] ${index + 1} / ${pendingAccounts.length} 件目の処理を開始します...`);
+            await this.processSingleAccount(account[ENRICHER_CONSTANTS.COLUMN.ID]);
+            
+            if (index < pendingAccounts.length - 1) {
+                const delay = 3000;
+                Logger.log(`[PAUSE] 次の処理まで ${delay / 1000} 秒待機します...`);
+                Utilities.sleep(delay);
+            }
+        }
+        
+        Logger.log(`[END BATCH] 今回のバッチ処理(${pendingAccounts.length}件)が完了しました。`);
+    } catch (e) {
+        Logger.log(`❌ [ERROR] 保留中アカウントの処理中にエラーが発生しました: ${e.message}`);
+        throw e;
     }
-
-    Logger.log(`[INFO] ${pendingAccounts.length}件のアカウントの情報収集を開始します。`);
-
-    for (const [index, account] of pendingAccounts.entries()) {
-      Logger.log(`[BATCH] ${index + 1} / ${pendingAccounts.length} 件目の処理を開始します...`);
-      await this.processSingleAccount(account[ENRICHER_CONSTANTS.COLUMN.ID]);
-      
-      if (index < pendingAccounts.length - 1) {
-          const delay = 1500;
-          Logger.log(`[PAUSE] 次の処理まで ${delay / 1000} 秒待機します...`);
-          Utilities.sleep(delay);
-      }
-    }
-    
-    Logger.log("[END] すべてのアカウントの情報収集処理が完了しました。");
   }
 
   async _findRecordById(tableName, recordId) {
@@ -336,5 +375,18 @@ class AccountEnricher {
     }
     Logger.log(`[WARN] テーブル[${tableName}]からID[${recordId}]のレコードが見つかりませんでした。`);
     return null;
+  }
+}
+
+/**
+ * 指定された名前のトリガーをすべて削除するヘルパー関数
+ */
+function _deleteTriggersByName(triggerFunctionName) {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  for (const trigger of allTriggers) {
+    if (trigger.getHandlerFunction() === triggerFunctionName) {
+      ScriptApp.deleteTrigger(trigger);
+      Logger.log(`古いトリガー (ID: ${trigger.getUniqueId()}) を削除しました。`);
+    }
   }
 }
